@@ -4,6 +4,7 @@
 #include "src/server/client_state.hpp"
 #include "src/server/command_dsl.hpp"
 #include "src/server/session_manager.hpp"
+#include <tmux2/reactor/reactor.hpp>
 
 #include <array>
 #include <functional>
@@ -42,6 +43,10 @@ public:
     // Broadcast frame diffs and layout updates for a session
     void broadcast_session_layout(uint32_t session_id);
     void broadcast_session_frames(uint32_t session_id, std::string_view status_line = "");
+
+    // PTY output polling & reactor integration
+    bool poll_panes();
+    void attach_to_reactor(tmux2::reactor::Reactor& reactor);
 
     // Mock PTY mode (for hermetic unit tests)
     void set_mock_pty(bool mock) noexcept { mock_pty_ = mock; }

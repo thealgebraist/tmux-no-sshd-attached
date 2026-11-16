@@ -3,6 +3,7 @@
 #include "src/protocol/cell.hpp"
 #include "src/protocol/messages.hpp"
 #include "src/pty/pty.hpp"
+#include "src/vte/vte.hpp"
 #include "src/server/layout.hpp"
 
 #include <cstdint>
@@ -37,7 +38,7 @@ public:
     [[nodiscard]] const std::string& title() const noexcept { return title_; }
     void set_title(std::string_view title) { title_ = title; }
 
-    [[nodiscard]] const protocol::CursorState& cursor() const noexcept { return cursor_; }
+    [[nodiscard]] protocol::CursorState cursor() const noexcept;
 
     // Resize
     void resize(uint16_t width, uint16_t height);
@@ -68,14 +69,11 @@ public:
     [[nodiscard]] pty::PtyProcess* pty() noexcept { return pty_.get(); }
     void set_pty(std::unique_ptr<pty::PtyProcess> pty) { pty_ = std::move(pty); }
 
-private:
-    void ensure_grid_size();
-    void scroll_up();
-    void mark_row_dirty(uint16_t row);
-    void process_escape_sequence(std::string_view seq);
-    void process_csi(std::string_view params, char cmd);
-    void process_osc(std::string_view osc_content);
+    // Direct access to VteScreen
+    [[nodiscard]] vte::VteScreen* vte() noexcept { return vte_.get(); }
+    [[nodiscard]] const vte::VteScreen* vte() const noexcept { return vte_.get(); }
 
+private:
     uint32_t pane_id_{0};
     Rect rect_{};
     uint16_t width_{80};
@@ -83,26 +81,7 @@ private:
     std::string title_{"tmux2"};
 
     std::unique_ptr<pty::PtyProcess> pty_;
-
-    protocol::CursorState cursor_{};
-    std::vector<protocol::Cell> grid_;
-    std::vector<bool> dirty_rows_;
-    std::vector<protocol::ScrollbackLine> scrollback_;
-
-    // Current style attribute state
-    uint16_t current_flags_{protocol::StyleFlags::None};
-    protocol::Color current_fg_{protocol::Color::default_color()};
-    protocol::Color current_bg_{protocol::Color::default_color()};
-
-    // Parser state machine
-    enum class ParserState {
-        Normal,
-        Escape,
-        Csi,
-        Osc,
-    };
-    ParserState parser_state_{ParserState::Normal};
-    std::string escape_buf_;
+    std::unique_ptr<vte::VteScreen> vte_;
 };
 
 } // namespace tmux2::server

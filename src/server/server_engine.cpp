@@ -363,11 +363,15 @@ void ServerEngine::handle_key_event(uint64_t client_id, const protocol::MsgKeyEv
         if (!ev.raw_bytes.empty()) {
             std::string_view data(reinterpret_cast<const char*>(ev.raw_bytes.data()), ev.raw_bytes.size());
             pane->write_input(data);
-            pane->feed_output(data);
+            if (!pane->has_pty()) {
+                pane->feed_output(data);
+            }
         } else if (ev.key_code > 0) {
             char ch = static_cast<char>(ev.key_code);
             pane->write_input(std::string_view(&ch, 1));
-            pane->feed_output(std::string_view(&ch, 1));
+            if (!pane->has_pty()) {
+                pane->feed_output(std::string_view(&ch, 1));
+            }
         }
         pane->read_pty();
         broadcast_session_frames(session->session_id());
@@ -404,7 +408,10 @@ void ServerEngine::handle_paste_event(uint64_t client_id, const protocol::MsgPas
         } else {
             pane->write_input(data);
         }
-        pane->feed_output(data);
+        if (!pane->has_pty()) {
+            pane->feed_output(data);
+        }
+        pane->read_pty();
         broadcast_session_frames(session->session_id());
     }
 }
@@ -480,6 +487,45 @@ void ServerEngine::broadcast_session_frames(uint32_t session_id, std::string_vie
             client->set_last_srv_seq(seq);
         }
         send_to_client(att.client_id, diff);
+    }
+}
+
+bool ServerEngine::poll_panes() {
+    bool any_read = false;
+    for (const auto& [sid, session] : session_manager_.sessions()) {
+        bool session_has_output = false;
+        for (const auto& win : session->windows()) {
+            for (const auto& [pid, pane] : win->panes()) {
+                if (pane->has_pty()) {
+                    if (pane->read_pty()) {
+                        session_has_output = true;
+                        any_read = true;
+                    }
+                }
+            }
+        }
+        if (session_has_output) {
+            broadcast_session_frames(sid);
+        }
+    }
+    return any_read;
+}
+
+void ServerEngine::attach_to_reactor(tmux2::reactor::Reactor& reactor) {
+    for (const auto& [sid, session] : session_manager_.sessions()) {
+        for (const auto& win : session->windows()) {
+            for (const auto& [pid, pane] : win->panes()) {
+                int fd = pane->master_fd();
+                if (fd >= 0 && !reactor.has_fd(fd)) {
+                    (void)reactor.register_fd(fd, tmux2::reactor::EventFlags::Readable,
+                        [this, sid = sid, pane = pane](int /*fd*/, tmux2::reactor::EventFlags /*events*/) {
+                            if (pane->read_pty()) {
+                                broadcast_session_frames(sid);
+                            }
+                        });
+                }
+            }
+        }
     }
 }
 

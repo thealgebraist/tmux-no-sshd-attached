@@ -124,14 +124,17 @@ bool Session::previous_window() {
 }
 
 std::shared_ptr<Window> Session::active_window() const {
-    return find_window(active_window_id_);
+    auto w = find_window(active_window_id_);
+    if (!w && !windows_.empty()) {
+        return windows_.front();
+    }
+    return w;
 }
 
 std::shared_ptr<Window> Session::find_window(uint32_t window_id) const {
     for (const auto& w : windows_) {
         if (w->window_id() == window_id) return w;
     }
-    if (!windows_.empty()) return windows_.front();
     return nullptr;
 }
 

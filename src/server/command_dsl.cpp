@@ -222,6 +222,36 @@ protocol::MsgCommandRpcResp CommandDsl::execute(
         return resp;
     }
 
+    if (cmd == "attach-session" || cmd == "attach" || cmd == "a") {
+        std::string target;
+        bool detach_others = false;
+        bool read_only = false;
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            if (tokens[i] == "-t" && i + 1 < tokens.size()) {
+                target = tokens[++i];
+            } else if (tokens[i] == "-d") {
+                detach_others = true;
+            } else if (tokens[i] == "-r") {
+                read_only = true;
+            } else if (target.empty() && !tokens[i].starts_with("-")) {
+                target = tokens[i];
+            }
+        }
+        auto s = resolve_session(mgr, target, current_session_id);
+        if (!s) {
+            resp.exit_code = 1;
+            resp.stderr_data = "Session not found: " + target + "\n";
+            return resp;
+        }
+        if (detach_others) {
+            auto others = s->attached_clients();
+            for (const auto& att : others) {
+                s->detach_client(att.client_id);
+            }
+        }
+        return resp;
+    }
+
     if (cmd == "kill-session") {
         std::string target;
         for (size_t i = 1; i < tokens.size(); ++i) {
@@ -547,16 +577,25 @@ protocol::MsgCommandRpcResp CommandDsl::execute(
             const auto& t = tokens[i];
             if (t == "Enter") {
                 pane->write_input("\r");
-                pane->feed_output("\r\n");
+                if (!pane->has_pty()) {
+                    pane->feed_output("\r\n");
+                }
             } else if (t == "C-c") {
                 pane->write_input("\x03");
-                pane->feed_output("^C\r\n");
+                if (!pane->has_pty()) {
+                    pane->feed_output("^C\r\n");
+                }
             } else if (t == "C-d") {
                 pane->write_input("\x04");
             } else {
                 pane->write_input(t);
-                pane->feed_output(t);
+                if (!pane->has_pty()) {
+                    pane->feed_output(t);
+                }
             }
+        }
+        if (pane->has_pty()) {
+            pane->read_pty();
         }
         return resp;
     }

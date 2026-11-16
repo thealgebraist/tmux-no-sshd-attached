@@ -14,6 +14,7 @@
 #include "src/protocol/cell.hpp"
 
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <filesystem>
 #include <fstream>
@@ -99,6 +100,39 @@ TEST_CASE("Platform Helpers") {
         CHECK(plist.find("<string>/usr/local/bin/tmux2</string>") != std::string::npos);
         CHECK(plist.find("<key>RunAtLoad</key>") != std::string::npos);
         CHECK(plist.find("<key>KeepAlive</key>") != std::string::npos);
+    }
+
+    SUBCASE("POSIX daemonization double fork and pidfile") {
+        auto tmp_pid = fs::temp_directory_path() / "test_tmux2_daemon.pid";
+        fs::remove(tmp_pid);
+
+        pid_t p = ::fork();
+        REQUIRE(p >= 0);
+        if (p == 0) {
+            DaemonizeOptions opts;
+            opts.pid_file = tmp_pid;
+            opts.close_fds = true;
+            auto res = daemonize(opts);
+            if (!res) ::_exit(1);
+            ::usleep(50000);
+            ::_exit(0);
+        }
+
+        int status = 0;
+        ::waitpid(p, &status, 0);
+        CHECK(WIFEXITED(status));
+        CHECK(WEXITSTATUS(status) == 0);
+
+        for (int i = 0; i < 50; ++i) {
+            if (fs::exists(tmp_pid) && fs::file_size(tmp_pid) > 0) break;
+            ::usleep(10000);
+        }
+        CHECK(fs::exists(tmp_pid));
+        std::ifstream pid_in(tmp_pid);
+        pid_t daemon_pid = 0;
+        pid_in >> daemon_pid;
+        CHECK(daemon_pid > 0);
+        fs::remove(tmp_pid);
     }
 }
 
@@ -342,6 +376,15 @@ TEST_CASE("Pane and Terminal Grid") {
         REQUIRE(!diff3.rows.empty());
         CHECK(diff3.rows[0].row == 0);
     }
+
+    SUBCASE("4-byte UTF-8 emoji and VteScreen integration") {
+        pane->feed_output("Rocket \xF0\x9F\x9A\x80 test\r\n");
+        std::string cap = pane->capture_text(false);
+        CHECK(cap.find("Rocket") != std::string::npos);
+        CHECK(cap.find("\xF0\x9F\x9A\x80") != std::string::npos);
+        CHECK(cap.find("test") != std::string::npos);
+        CHECK(pane->vte() != nullptr);
+    }
 }
 
 // ============================================================================
@@ -471,6 +514,12 @@ TEST_CASE("Session & Multi-Client Attachment") {
         auto it = std::find_if(clients.begin(), clients.end(), [](const auto& c) { return c.client_id == 400; });
         REQUIRE(it != clients.end());
         CHECK(it->read_only == true);
+    }
+
+    SUBCASE("Window lookup strictly returns nullptr for nonexistent window") {
+        CHECK(sess->find_window(9999) == nullptr);
+        CHECK(sess->select_window(9999) == false);
+        CHECK(sess->active_window() != nullptr);
     }
 }
 
@@ -694,6 +743,23 @@ TEST_CASE("Command DSL") {
         CHECK(kill_s.exit_code == 0);
         CHECK(mgr.find_session_by_name("doomed") == nullptr);
     }
+
+    SUBCASE("attach-session and detach") {
+        CommandDsl::execute(mgr, "new-session -s att-sess", 1, 0, true);
+        auto s = mgr.find_session_by_name("att-sess");
+        REQUIRE(s != nullptr);
+        s->attach_client(10, false, 80, 24);
+        s->attach_client(20, false, 80, 24);
+        CHECK(s->attached_client_count() == 2);
+
+        // attach with -d detaches existing clients
+        auto att_d = CommandDsl::execute(mgr, "attach-session -t att-sess -d", 2, 0, true);
+        CHECK(att_d.exit_code == 0);
+        CHECK(s->attached_client_count() == 0);
+
+        auto att_bad = CommandDsl::execute(mgr, "attach-session -t nonexistent", 3, 0, true);
+        CHECK(att_bad.exit_code == 1);
+    }
 }
 
 // ============================================================================
@@ -886,5 +952,17 @@ TEST_CASE("ServerEngine Protocol Integration") {
         CHECK(rpc_resp->rpc_id == 42);
         CHECK(rpc_resp->exit_code == 0);
         CHECK(engine.session_manager().find_session_by_name("rpc-sess") != nullptr);
+    }
+
+    SUBCASE("Reactor and PTY polling integration") {
+        auto reactor_res = tmux2::reactor::Reactor::create_default();
+        REQUIRE(reactor_res.has_value());
+        auto reactor = std::move(*reactor_res);
+
+        // Attach engine to reactor
+        engine.attach_to_reactor(*reactor);
+
+        // Poll panes returns false when no pty output in mock mode
+        CHECK_FALSE(engine.poll_panes());
     }
 }

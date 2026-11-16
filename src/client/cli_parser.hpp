@@ -13,6 +13,8 @@ enum class CliCommandType {
     None,
     Help,
     Version,
+    PrintSystemdUnit,
+    PrintLaunchdPlist,
     PkiInit,
     PkiExportClient,
     ProfileImport,
@@ -47,6 +49,14 @@ struct CliOptions {
     int64_t capture_start{0};     // -S
     int64_t capture_end{-1};      // -E
 
+    // Extended server/client flags
+    std::string unix_socket;      // --unix-socket <path>
+    std::string listen_addr;      // --listen <addr>
+    bool tcp_only{false};         // --tcp-only / --no-quic
+    std::string pid_file;         // --pid-file <path>
+    std::string config_dir;       // --config-dir <dir>
+    std::string server_addr;      // --server <addr>
+
     // PKI options
     std::string pki_host;
     std::string pki_user{"alice"};
@@ -67,8 +77,8 @@ struct CliOptions {
 
 class CliParser {
 public:
-    static CliOptions parse(int argc, const char* const* argv);
-    static CliOptions parse(std::span<const std::string_view> args);
+    static CliOptions parse(int argc, const char* const* argv, bool is_daemon_default = false);
+    static CliOptions parse(std::span<const std::string_view> args, bool is_daemon_default = false);
 
     static std::string format_help();
     static std::string format_version();

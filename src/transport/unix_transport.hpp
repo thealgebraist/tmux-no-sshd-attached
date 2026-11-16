@@ -103,6 +103,7 @@ private:
 
     std::vector<std::byte> m_in_buffer;
     std::vector<std::byte> m_out_buffer;
+    bool m_processing_inbound{false};
 };
 
 class UnixListener : public IListener {

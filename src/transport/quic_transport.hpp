@@ -49,6 +49,7 @@ private:
     DataCallback m_on_data;
     std::vector<std::byte> m_in_buffer;
     std::vector<std::byte> m_out_buffer;
+    bool m_polling{false};
 };
 
 class QuicConnection : public IConnection, public std::enable_shared_from_this<QuicConnection> {
@@ -156,6 +157,7 @@ private:
     reactor::Reactor* m_reactor{nullptr};
     reactor::TimerId m_timer_id{reactor::kInvalidTimerId};
     AcceptCallback m_on_accept;
+    std::vector<std::weak_ptr<QuicConnection>> m_connections;
 };
 
 class QuicConnector {

@@ -303,6 +303,13 @@ void UnixConnection::flush_outbound() {
 }
 
 void UnixConnection::process_inbound_bytes() {
+    if (m_processing_inbound) return;
+    m_processing_inbound = true;
+    struct Guard {
+        bool& flag;
+        ~Guard() { flag = false; }
+    } guard{m_processing_inbound};
+
     while (m_in_buffer.size() >= protocol::kStreamHeaderSize) {
         auto hdr_res = protocol::decode_header(
             std::span<const std::byte>(m_in_buffer.data(), protocol::kStreamHeaderSize)
@@ -318,10 +325,11 @@ void UnixConnection::process_inbound_bytes() {
             break;
         }
 
-        std::span<const std::byte> payload(
-            m_in_buffer.data() + protocol::kStreamHeaderSize,
-            hdr.payload_len
+        std::vector<std::byte> payload(
+            m_in_buffer.begin() + protocol::kStreamHeaderSize,
+            m_in_buffer.begin() + total_len
         );
+        m_in_buffer.erase(m_in_buffer.begin(), m_in_buffer.begin() + total_len);
 
         auto it = m_streams.find(hdr.stream_id);
         std::shared_ptr<UnixStream> stream;
@@ -338,8 +346,6 @@ void UnixConnection::process_inbound_bytes() {
         if (stream) {
             stream->deliver_frame(hdr, payload);
         }
-
-        m_in_buffer.erase(m_in_buffer.begin(), m_in_buffer.begin() + total_len);
     }
 }
 

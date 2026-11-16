@@ -153,7 +153,12 @@ void QuicStream::set_on_data(DataCallback cb) {
 }
 
 void QuicStream::poll_stream() {
-    if (is_closed()) return;
+    if (m_polling || is_closed()) return;
+    m_polling = true;
+    struct Guard {
+        bool& flag;
+        ~Guard() { flag = false; }
+    } guard{m_polling};
 
     flush_outbound();
 
@@ -186,16 +191,17 @@ void QuicStream::poll_stream() {
                 break; // Incomplete payload
             }
 
-            std::span<const std::byte> payload(
-                m_in_buffer.data() + protocol::kStreamHeaderSize,
-                hdr.payload_len
+            std::vector<std::byte> payload(
+                m_in_buffer.begin() + protocol::kStreamHeaderSize,
+                m_in_buffer.begin() + total_len
             );
-            m_on_frame(hdr, payload);
             m_in_buffer.erase(m_in_buffer.begin(), m_in_buffer.begin() + total_len);
+            m_on_frame(hdr, payload);
         }
     } else if (m_on_data && !m_in_buffer.empty()) {
-        m_on_data(m_in_buffer);
+        auto d = std::move(m_in_buffer);
         m_in_buffer.clear();
+        m_on_data(d);
     }
 }
 
@@ -296,7 +302,7 @@ void QuicConnection::set_on_stream(StreamCallback cb) {
 
 void QuicConnection::register_with_reactor(reactor::Reactor& reactor) {
     m_reactor = &reactor;
-    if (m_fd < 0 || !m_ssl) return;
+    if (!m_owns_fd || m_fd < 0 || !m_ssl) return;
 
     reactor::EventFlags flags = reactor::EventFlags::Readable;
     if (SSL_net_write_desired(m_ssl.get())) {
@@ -317,7 +323,7 @@ void QuicConnection::unregister_from_reactor(reactor::Reactor& reactor) {
         reactor.timer_heap().cancel(m_timer_id);
         m_timer_id = reactor::kInvalidTimerId;
     }
-    if (m_fd >= 0) {
+    if (m_owns_fd && m_fd >= 0) {
         (void)reactor.unregister_fd(m_fd);
     }
     m_reactor = nullptr;
@@ -357,7 +363,7 @@ void QuicConnection::poll_io() {
         }
     }
 
-    if (m_reactor && m_fd >= 0) {
+    if (m_reactor && m_fd >= 0 && m_owns_fd) {
         reactor::EventFlags flags = reactor::EventFlags::Readable;
         if (SSL_net_write_desired(m_ssl.get())) {
             flags |= reactor::EventFlags::Writable;
@@ -474,6 +480,8 @@ std::expected<std::shared_ptr<IConnection>, std::error_code> QuicListener::accep
         SSL_handle_events(listener);
     });
 
+    m_connections.push_back(conn);
+
     if (m_on_accept) {
         m_on_accept(conn);
     }
@@ -491,8 +499,18 @@ void QuicListener::register_with_reactor(reactor::Reactor& reactor) {
 
     (void)m_reactor->register_fd(m_fd, reactor::EventFlags::Readable,
         [this](int, reactor::EventFlags) {
-            auto res = accept_connection();
-            (void)res;
+            while (true) {
+                auto res = accept_connection();
+                if (!res) break;
+            }
+            for (auto it = m_connections.begin(); it != m_connections.end();) {
+                if (auto conn = it->lock()) {
+                    conn->poll_io();
+                    ++it;
+                } else {
+                    it = m_connections.erase(it);
+                }
+            }
             if (m_reactor && m_listener) {
                 m_reactor->sync_openssl_timeout(m_listener.get(), m_timer_id);
             }
@@ -607,8 +625,10 @@ std::expected<std::shared_ptr<QuicConnection>, std::string> QuicConnector::conne
 
         int err = SSL_get_error(ssl.get(), ret);
         if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            char err_buf[256];
+            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
             ::close(fd);
-            return std::unexpected("QUIC handshake failed with error: " + std::to_string(err));
+            return std::unexpected("QUIC handshake failed with error: " + std::to_string(err) + " (" + err_buf + ")");
         }
 
         SSL_handle_events(ssl.get());

@@ -350,6 +350,9 @@ set(TMUX2_CORE_SOURCES
     src/client/tty_raw.cpp
     src/client/copy_mode.cpp
     src/client/cli_parser.cpp
+    src/app/pki_commands.cpp
+    src/app/daemon_runner.cpp
+    src/app/client_runner.cpp
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/transport/transport.hpp")
@@ -399,21 +402,14 @@ endif()
 # -----------------------------------------------------------------------------
 enable_testing()
 
-set(TEST_SOURCES
-    tests/test_reactor.cpp
-    tests/test_pki_config.cpp
-    tests/test_protocol.cpp
-    tests/test_pty_vte.cpp
-    tests/test_transport.cpp
-    tests/test_server.cpp
-    tests/test_client.cpp
-)
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_*.cpp")
 
 foreach(TSRC IN LISTS TEST_SOURCES)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TSRC}")
+    if(EXISTS "${TSRC}")
         get_filename_component(TNAME ${TSRC} NAME_WE)
         add_executable(${TNAME} ${TSRC})
         target_link_libraries(${TNAME} PRIVATE tmux2_core doctest::doctest)
+        target_compile_definitions(${TNAME} PRIVATE TMUX2_BIN_PATH="$<TARGET_FILE:tmux2>")
         add_test(NAME ${TNAME} COMMAND ${TNAME})
     endif()
 endforeach()

@@ -1,11 +1,13 @@
 # Build directories
 build/
+build-*/
 cmake-build-*/
 /tmp/tmux2-cmake-build/
 CMakeFiles/
 CMakeCache.txt
 CTestTestfile.cmake
 cmake_install.cmake
+_deps/
 
 # Object and library files
 *.o
@@ -16,6 +18,7 @@ cmake_install.cmake
 *.so.*
 *.dylib
 *.dll
+*.dSYM/
 
 # Executables and symlinks
 tmux2
@@ -35,5 +38,7 @@ test_client
 .vscode/
 *.swp
 *~
+core
+*.core
 compile_commands.json
 Testing/

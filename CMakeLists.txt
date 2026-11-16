@@ -3,13 +3,18 @@ project(tmux2 VERSION 1.0.0 LANGUAGES C CXX)
 
 # Ensure subprojects with older cmake_minimum_required remain compatible on CMake 4+
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for dependencies")
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+endif()
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    add_compile_options(-Wall -Wextra -pedantic)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
+                        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+                        $<$<COMPILE_LANGUAGE:CXX>:-pedantic>)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -25,11 +30,32 @@ if(APPLE)
         )
         if(EXISTS "${HOMEBREW_OPENSSL_PREFIX}")
             set(OPENSSL_ROOT_DIR "${HOMEBREW_OPENSSL_PREFIX}" CACHE PATH "Path to OpenSSL root directory")
+        elseif(EXISTS "/opt/homebrew/opt/openssl@3")
+            set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3" CACHE PATH "Path to OpenSSL root directory")
+        elseif(EXISTS "/usr/local/opt/openssl@3")
+            set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl@3" CACHE PATH "Path to OpenSSL root directory")
         endif()
     endif()
 endif()
 
-find_package(OpenSSL 3.5 REQUIRED COMPONENTS SSL Crypto)
+find_package(OpenSSL 3.5 QUIET COMPONENTS SSL Crypto)
+if(NOT OpenSSL_FOUND)
+    if(APPLE)
+        message(FATAL_ERROR
+            "OpenSSL 3.5+ (COMPONENTS SSL Crypto) was not found.\n"
+            "On macOS, please install OpenSSL 3 via Homebrew:\n"
+            "  brew install openssl@3\n"
+            "If already installed in a custom location, specify OPENSSL_ROOT_DIR:\n"
+            "  cmake -B build -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)\n"
+        )
+    else()
+        message(FATAL_ERROR
+            "OpenSSL 3.5+ (COMPONENTS SSL Crypto) was not found.\n"
+            "Please install OpenSSL 3.5+ development packages or specify OPENSSL_ROOT_DIR:\n"
+            "  cmake -B build -DOPENSSL_ROOT_DIR=/path/to/openssl\n"
+        )
+    endif()
+endif()
 
 # -----------------------------------------------------------------------------
 # System Dependencies & FetchContent Fallbacks
@@ -46,6 +72,13 @@ if(TMUX2_USE_SYSTEM_DEPS)
     find_package(doctest CONFIG QUIET)
     if(TARGET doctest::doctest)
         set(DOCTEST_FOUND TRUE)
+    else()
+        find_path(DOCTEST_INCLUDE_DIR NAMES doctest/doctest.h)
+        if(DOCTEST_INCLUDE_DIR)
+            add_library(doctest::doctest INTERFACE IMPORTED)
+            target_include_directories(doctest::doctest INTERFACE ${DOCTEST_INCLUDE_DIR})
+            set(DOCTEST_FOUND TRUE)
+        endif()
     endif()
 endif()
 
@@ -72,6 +105,14 @@ if(TMUX2_USE_SYSTEM_DEPS)
             add_library(tomlplusplus::tomlplusplus INTERFACE IMPORTED)
             target_include_directories(tomlplusplus::tomlplusplus INTERFACE ${PKG_TOMLPLUSPLUS_INCLUDE_DIRS})
             target_link_libraries(tomlplusplus::tomlplusplus INTERFACE ${PKG_TOMLPLUSPLUS_LIBRARIES})
+            set(TOMLPLUSPLUS_FOUND TRUE)
+        endif()
+    endif()
+    if(NOT TOMLPLUSPLUS_FOUND)
+        find_path(TOMLPLUSPLUS_INCLUDE_DIR NAMES toml++/toml.hpp toml.hpp)
+        if(TOMLPLUSPLUS_INCLUDE_DIR)
+            add_library(tomlplusplus::tomlplusplus INTERFACE IMPORTED)
+            target_include_directories(tomlplusplus::tomlplusplus INTERFACE ${TOMLPLUSPLUS_INCLUDE_DIR})
             set(TOMLPLUSPLUS_FOUND TRUE)
         endif()
     endif()
@@ -110,6 +151,16 @@ if(TMUX2_USE_SYSTEM_DEPS)
             set(ZSTD_FOUND TRUE)
         endif()
     endif()
+    if(NOT ZSTD_FOUND)
+        find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
+        find_library(ZSTD_LIBRARY NAMES zstd)
+        if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+            add_library(zstd::libzstd INTERFACE IMPORTED)
+            target_include_directories(zstd::libzstd INTERFACE ${ZSTD_INCLUDE_DIR})
+            target_link_libraries(zstd::libzstd INTERFACE ${ZSTD_LIBRARY})
+            set(ZSTD_FOUND TRUE)
+        endif()
+    endif()
 endif()
 
 if(NOT ZSTD_FOUND)
@@ -133,13 +184,25 @@ endif()
 
 # 4. libvterm
 set(VTERM_FOUND FALSE)
-if(TMUX2_USE_SYSTEM_DEPS AND PKG_CONFIG_FOUND)
-    pkg_check_modules(PKG_VTERM QUIET vterm)
-    if(PKG_VTERM_FOUND)
-        add_library(vterm::vterm INTERFACE IMPORTED)
-        target_include_directories(vterm::vterm INTERFACE ${PKG_VTERM_INCLUDE_DIRS})
-        target_link_libraries(vterm::vterm INTERFACE ${PKG_VTERM_LIBRARIES})
-        set(VTERM_FOUND TRUE)
+if(TMUX2_USE_SYSTEM_DEPS)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(PKG_VTERM QUIET vterm)
+        if(PKG_VTERM_FOUND)
+            add_library(vterm::vterm INTERFACE IMPORTED)
+            target_include_directories(vterm::vterm INTERFACE ${PKG_VTERM_INCLUDE_DIRS})
+            target_link_libraries(vterm::vterm INTERFACE ${PKG_VTERM_LIBRARIES})
+            set(VTERM_FOUND TRUE)
+        endif()
+    endif()
+    if(NOT VTERM_FOUND)
+        find_path(VTERM_INCLUDE_DIR NAMES vterm.h)
+        find_library(VTERM_LIBRARY NAMES vterm)
+        if(VTERM_INCLUDE_DIR AND VTERM_LIBRARY)
+            add_library(vterm::vterm INTERFACE IMPORTED)
+            target_include_directories(vterm::vterm INTERFACE ${VTERM_INCLUDE_DIR})
+            target_link_libraries(vterm::vterm INTERFACE ${VTERM_LIBRARY})
+            set(VTERM_FOUND TRUE)
+        endif()
     endif()
 endif()
 
@@ -154,17 +217,70 @@ if(NOT VTERM_FOUND)
     FetchContent_GetProperties(vterm)
     if(NOT vterm_POPULATED)
         FetchContent_Populate(vterm)
-        find_package(Perl REQUIRED)
-        execute_process(
-            COMMAND ${PERL_EXECUTABLE} -CSD tbl2inc_c.pl src/encoding/DECdrawing.tbl
-            WORKING_DIRECTORY ${vterm_SOURCE_DIR}
-            OUTPUT_FILE ${vterm_SOURCE_DIR}/src/encoding/DECdrawing.inc
-        )
-        execute_process(
-            COMMAND ${PERL_EXECUTABLE} -CSD tbl2inc_c.pl src/encoding/uk.tbl
-            WORKING_DIRECTORY ${vterm_SOURCE_DIR}
-            OUTPUT_FILE ${vterm_SOURCE_DIR}/src/encoding/uk.inc
-        )
+        find_package(Perl QUIET)
+        if(PERL_FOUND)
+            execute_process(
+                COMMAND ${PERL_EXECUTABLE} -CSD tbl2inc_c.pl src/encoding/DECdrawing.tbl
+                WORKING_DIRECTORY ${vterm_SOURCE_DIR}
+                OUTPUT_FILE ${vterm_SOURCE_DIR}/src/encoding/DECdrawing.inc
+            )
+            execute_process(
+                COMMAND ${PERL_EXECUTABLE} -CSD tbl2inc_c.pl src/encoding/uk.tbl
+                WORKING_DIRECTORY ${vterm_SOURCE_DIR}
+                OUTPUT_FILE ${vterm_SOURCE_DIR}/src/encoding/uk.inc
+            )
+        endif()
+        if(NOT EXISTS "${vterm_SOURCE_DIR}/src/encoding/DECdrawing.inc")
+            file(WRITE "${vterm_SOURCE_DIR}/src/encoding/DECdrawing.inc"
+"static const struct StaticTableEncoding encoding_DECdrawing = {
+  { .decode = &decode_table },
+  {
+    [0x60] = 0x25C6,
+    [0x61] = 0x2592,
+    [0x62] = 0x2409,
+    [0x63] = 0x240C,
+    [0x64] = 0x240D,
+    [0x65] = 0x240A,
+    [0x66] = 0x00B0,
+    [0x67] = 0x00B1,
+    [0x68] = 0x2424,
+    [0x69] = 0x240B,
+    [0x6a] = 0x2518,
+    [0x6b] = 0x2510,
+    [0x6c] = 0x250C,
+    [0x6d] = 0x2514,
+    [0x6e] = 0x253C,
+    [0x6f] = 0x23BA,
+    [0x70] = 0x23BB,
+    [0x71] = 0x2500,
+    [0x72] = 0x23BC,
+    [0x73] = 0x23BD,
+    [0x74] = 0x251C,
+    [0x75] = 0x2524,
+    [0x76] = 0x2534,
+    [0x77] = 0x252C,
+    [0x78] = 0x2502,
+    [0x79] = 0x2A7D,
+    [0x7a] = 0x2A7E,
+    [0x7b] = 0x03C0,
+    [0x7c] = 0x2260,
+    [0x7d] = 0x00A3,
+    [0x7e] = 0x00B7,
+  }
+};
+")
+        endif()
+        if(NOT EXISTS "${vterm_SOURCE_DIR}/src/encoding/uk.inc")
+            file(WRITE "${vterm_SOURCE_DIR}/src/encoding/uk.inc"
+"static const struct StaticTableEncoding encoding_uk = {
+  { .decode = &decode_table },
+  {
+    [0x23] = 0x00a3,
+  }
+};
+")
+        endif()
+
         set(VTERM_SRCS
             ${vterm_SOURCE_DIR}/src/encoding.c
             ${vterm_SOURCE_DIR}/src/keyboard.c

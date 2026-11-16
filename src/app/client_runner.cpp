@@ -267,11 +267,14 @@ connect_transport(const client::CliOptions& opts) {
     pid_t pid = ::fork();
     if (pid == 0) {
         std::string sock_str = sock_path.string();
+        std::string pid_str = sock_path.string() + ".pid";
         char* const argv[] = {
             const_cast<char*>(exe_str.c_str()),
             const_cast<char*>("server"),
             const_cast<char*>("--unix-socket"),
             const_cast<char*>(sock_str.c_str()),
+            const_cast<char*>("--pid-file"),
+            const_cast<char*>(pid_str.c_str()),
             const_cast<char*>("--daemonize"),
             nullptr
         };
@@ -421,63 +424,68 @@ int run_client(const client::CliOptions& opts) {
 
     std::string resume_token;
     uint64_t last_srv_seq = 0;
+    bool user_detached = false;
 
-    stream->set_on_frame([&](const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
-        std::vector<std::byte> decomp;
-        std::span<const std::byte> eff = payload;
-        if (hdr.is_compressed()) {
-            auto d = protocol::zstd_decompress(payload);
-            if (d) {
-                decomp = std::move(*d);
-                eff = decomp;
-            }
-        }
-        protocol::BinaryReader reader(eff);
-        auto msg_res = protocol::decode_message_payload(static_cast<protocol::MsgType>(hdr.msg_type), reader);
-        if (!msg_res) return;
-
-        if (std::holds_alternative<protocol::MsgServerHello>(*msg_res)) {
-            const auto& s_hello = std::get<protocol::MsgServerHello>(*msg_res);
-            resume_token = s_hello.resume_token;
-
-            auto replay = app.prepare_reconnect_replay(s_hello.last_client_seq_acked);
-            for (const auto& rmsg : replay) {
-                (void)send_stream_message(*stream, rmsg);
-            }
-
-            if (app.attached_session_id() == 0) {
-                if (opts.command == client::CliCommandType::NewSession) {
-                    protocol::MsgNewSessionReq new_req;
-                    new_req.name = opts.session_name.empty() ? "0" : opts.session_name;
-                    new_req.initial_window_name = opts.window_name;
-                    new_req.cwd = opts.cwd;
-                    new_req.detached = false;
-                    (void)send_stream_message(*stream, new_req);
-                } else {
-                    protocol::MsgAttachSessionReq att;
-                    att.session_name = opts.session_name;
-                    att.read_only = opts.read_only;
-                    (void)send_stream_message(*stream, att);
+    auto setup_stream_callbacks = [&](std::shared_ptr<transport::IStream>& s) {
+        s->set_on_frame([&, s](const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
+            std::vector<std::byte> decomp;
+            std::span<const std::byte> eff = payload;
+            if (hdr.is_compressed()) {
+                auto d = protocol::zstd_decompress(payload);
+                if (d) {
+                    decomp = std::move(*d);
+                    eff = decomp;
                 }
             }
-        } else if (std::holds_alternative<protocol::MsgFrameDiff>(*msg_res)) {
-            last_srv_seq = std::get<protocol::MsgFrameDiff>(*msg_res).server_seq;
-        } else if (std::holds_alternative<protocol::MsgScreenSnapshot>(*msg_res)) {
-            last_srv_seq = std::get<protocol::MsgScreenSnapshot>(*msg_res).server_seq;
-        }
+            protocol::BinaryReader reader(eff);
+            auto msg_res = protocol::decode_message_payload(static_cast<protocol::MsgType>(hdr.msg_type), reader);
+            if (!msg_res) return;
 
-        auto s_res = app.handle_server_message(*msg_res);
-        if (!s_res.terminal_output.empty()) {
-            [[maybe_unused]] auto w = ::write(1, s_res.terminal_output.data(), s_res.terminal_output.size());
-        }
-        if (s_res.should_redraw) {
-            std::string frame = app.render_frame();
-            [[maybe_unused]] auto w = ::write(1, frame.data(), frame.size());
-        }
-        if (s_res.slice_req) {
-            (void)send_stream_message(*stream, *s_res.slice_req);
-        }
-    });
+            if (std::holds_alternative<protocol::MsgServerHello>(*msg_res)) {
+                const auto& s_hello = std::get<protocol::MsgServerHello>(*msg_res);
+                resume_token = s_hello.resume_token;
+
+                auto replay = app.prepare_reconnect_replay(s_hello.last_client_seq_acked);
+                for (const auto& rmsg : replay) {
+                    (void)send_stream_message(*s, rmsg);
+                }
+
+                if (app.attached_session_id() == 0) {
+                    if (opts.command == client::CliCommandType::NewSession) {
+                        protocol::MsgNewSessionReq new_req;
+                        new_req.name = opts.session_name.empty() ? "0" : opts.session_name;
+                        new_req.initial_window_name = opts.window_name;
+                        new_req.cwd = opts.cwd;
+                        new_req.detached = false;
+                        (void)send_stream_message(*s, new_req);
+                    } else {
+                        protocol::MsgAttachSessionReq att;
+                        att.session_name = opts.session_name;
+                        att.read_only = opts.read_only;
+                        (void)send_stream_message(*s, att);
+                    }
+                }
+            } else if (std::holds_alternative<protocol::MsgFrameDiff>(*msg_res)) {
+                last_srv_seq = std::get<protocol::MsgFrameDiff>(*msg_res).server_seq;
+            } else if (std::holds_alternative<protocol::MsgScreenSnapshot>(*msg_res)) {
+                last_srv_seq = std::get<protocol::MsgScreenSnapshot>(*msg_res).server_seq;
+            }
+
+            auto s_res = app.handle_server_message(*msg_res);
+            if (!s_res.terminal_output.empty()) {
+                [[maybe_unused]] auto w = ::write(1, s_res.terminal_output.data(), s_res.terminal_output.size());
+            }
+            if (s_res.should_redraw) {
+                std::string frame = app.render_frame();
+                [[maybe_unused]] auto w = ::write(1, frame.data(), frame.size());
+            }
+            if (s_res.slice_req) {
+                (void)send_stream_message(*s, *s_res.slice_req);
+            }
+        });
+    };
+
+    setup_stream_callbacks(stream);
 
     // Send initial ClientHello
     protocol::MsgClientHello hello;
@@ -486,12 +494,63 @@ int run_client(const client::CliOptions& opts) {
     hello.target = opts.session_name;
     (void)send_stream_message(*stream, hello);
 
+    // Periodic 16ms timer for I/O polling and automatic reconnect
+    std::chrono::steady_clock::time_point last_reconnect{};
+    reactor.add_repeating_timer(std::chrono::milliseconds(16), [&](reactor::TimerId) {
+        if (user_detached) return;
+
+        if (conn && conn->is_connected()) {
+            conn->poll_io();
+            return;
+        }
+
+        // Connection lost: attempt reconnect
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_reconnect < std::chrono::milliseconds(250)) {
+            return;
+        }
+        last_reconnect = now;
+
+        auto reconn_res = connect_transport(opts);
+        if (reconn_res) {
+            if (conn) {
+                conn->unregister_from_reactor(reactor);
+                conn->close();
+            }
+            conn = *reconn_res;
+            conn->register_with_reactor(reactor);
+
+            if (conn->type() == transport::TransportType::Quic) {
+                auto s_res = conn->open_stream(0, true);
+                if (s_res) {
+                    stream = *s_res;
+                } else {
+                    return;
+                }
+            } else {
+                stream = conn->get_stream(0);
+            }
+
+            if (stream) {
+                setup_stream_callbacks(stream);
+                protocol::MsgClientHello h;
+                h.protocol_version = 1;
+                h.term_caps = 0x01;
+                h.target = opts.session_name;
+                h.resume_token = resume_token;
+                h.last_srv_seq = last_srv_seq;
+                (void)send_stream_message(*stream, h);
+            }
+        }
+    });
+
     // Stdin handling on reactor
     if (is_tty) {
         (void)reactor.register_fd(0, reactor::EventFlags::Readable, [&](int fd, reactor::EventFlags) {
             uint8_t in_buf[1024];
             ssize_t n = ::read(fd, in_buf, sizeof(in_buf));
             if (n <= 0) {
+                user_detached = true;
                 reactor.stop();
                 return;
             }
@@ -503,10 +562,13 @@ int run_client(const client::CliOptions& opts) {
                 std::string frame = app.render_frame();
                 [[maybe_unused]] auto w = ::write(1, frame.data(), frame.size());
             }
-            for (const auto& out_msg : pres.outbound_messages) {
-                (void)send_stream_message(*stream, out_msg);
+            if (stream && conn && conn->is_connected()) {
+                for (const auto& out_msg : pres.outbound_messages) {
+                    (void)send_stream_message(*stream, out_msg);
+                }
             }
             if (pres.should_detach) {
+                user_detached = true;
                 reactor.stop();
             }
         });
@@ -518,13 +580,17 @@ int run_client(const client::CliOptions& opts) {
         protocol::MsgClientResize rsz;
         rsz.cols = new_ws.cols;
         rsz.rows = new_ws.rows;
-        (void)send_stream_message(*stream, rsz);
+        if (stream && conn && conn->is_connected()) {
+            (void)send_stream_message(*stream, rsz);
+        }
     });
 
     (void)reactor.register_signal(SIGINT, [&](int) {
+        user_detached = true;
         reactor.stop();
     });
     (void)reactor.register_signal(SIGTERM, [&](int) {
+        user_detached = true;
         reactor.stop();
     });
 
@@ -539,8 +605,6 @@ int run_client(const client::CliOptions& opts) {
     }
 
     conn->unregister_from_reactor(reactor);
-    conn->close();
-    return 0;
     conn->close();
     return 0;
 }

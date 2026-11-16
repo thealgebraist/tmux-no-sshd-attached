@@ -129,14 +129,16 @@ int run_daemon(const client::CliOptions& opts) {
     };
     std::unordered_map<uint64_t, ClientSession> client_sessions;
     std::unordered_map<uint64_t, std::shared_ptr<transport::IStream>> client_streams;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> disconnected_clients;
     uint64_t next_client_id = 1;
 
     // Stream frame callback & message sender setup
-    auto setup_stream = [&](uint64_t client_id, const std::shared_ptr<transport::IStream>& stream) {
+    auto setup_stream = [&](std::shared_ptr<uint64_t> id_ptr, const std::shared_ptr<transport::IStream>& stream) {
         if (!stream) return;
+        uint64_t client_id = *id_ptr;
         client_streams[client_id] = stream;
 
-        stream->set_on_frame([&engine, client_id](const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
+        stream->set_on_frame([&engine, &reactor, &client_sessions, &client_streams, &disconnected_clients, id_ptr](const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
             std::vector<std::byte> decompressed;
             std::span<const std::byte> effective = payload;
             if (hdr.is_compressed()) {
@@ -149,7 +151,62 @@ int run_daemon(const client::CliOptions& opts) {
             protocol::BinaryReader reader(effective);
             auto msg_res = protocol::decode_message_payload(static_cast<protocol::MsgType>(hdr.msg_type), reader);
             if (msg_res) {
-                engine.handle_message(client_id, *msg_res);
+                if (std::holds_alternative<protocol::MsgClientHello>(*msg_res)) {
+                    const auto& hello = std::get<protocol::MsgClientHello>(*msg_res);
+                    if (!hello.resume_token.empty()) {
+                        size_t dot = hello.resume_token.find('.');
+                        if (dot != std::string::npos) {
+                            try {
+                                uint64_t cand_id = std::stoull(hello.resume_token.substr(0, dot));
+                                auto existing_client = engine.get_client(cand_id);
+                                if (existing_client) {
+                                    uint64_t old_id = *id_ptr;
+                                    std::string peer_fp = "local-uid";
+                                    auto new_cs_it = client_sessions.find(old_id);
+                                    if (new_cs_it != client_sessions.end() && new_cs_it->second.conn) {
+                                        if (new_cs_it->second.conn->type() != transport::TransportType::Unix) {
+                                            auto pid = new_cs_it->second.conn->peer_identity();
+                                            if (pid && !pid->cert_fingerprint.empty()) peer_fp = pid->cert_fingerprint;
+                                            else peer_fp = "tls-authenticated-peer";
+                                        }
+                                    }
+
+                                    if (peer_fp == existing_client->cert_fingerprint() &&
+                                        server::ClientState::validate_resume_token(
+                                            hello.resume_token, cand_id, existing_client->cert_fingerprint(), engine.hmac_key())) {
+                                        disconnected_clients.erase(cand_id);
+                                        if (old_id != cand_id) {
+                                            auto sit = client_sessions.find(old_id);
+                                            if (sit != client_sessions.end()) {
+                                                if (sit->second.registered) {
+                                                    engine.unregister_client(old_id);
+                                                }
+                                                auto old_cand_it = client_sessions.find(cand_id);
+                                                if (old_cand_it != client_sessions.end()) {
+                                                    if (old_cand_it->second.conn) {
+                                                        old_cand_it->second.conn->unregister_from_reactor(reactor);
+                                                        old_cand_it->second.conn->close();
+                                                    }
+                                                    client_sessions.erase(old_cand_it);
+                                                }
+                                                client_sessions[cand_id] = std::move(sit->second);
+                                                client_sessions[cand_id].registered = true;
+                                                client_sessions.erase(sit);
+                                            }
+                                            auto st_it = client_streams.find(old_id);
+                                            if (st_it != client_streams.end()) {
+                                                client_streams[cand_id] = std::move(st_it->second);
+                                                client_streams.erase(st_it);
+                                            }
+                                            *id_ptr = cand_id;
+                                        }
+                                    }
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                }
+                engine.handle_message(*id_ptr, *msg_res);
             }
         });
     };
@@ -159,6 +216,7 @@ int run_daemon(const client::CliOptions& opts) {
         conn->register_with_reactor(reactor);
 
         uint64_t client_id = next_client_id++;
+        auto id_ptr = std::make_shared<uint64_t>(client_id);
         bool is_conn = conn->is_connected();
         client_sessions[client_id] = ClientSession{
             .conn = conn,
@@ -167,8 +225,9 @@ int run_daemon(const client::CliOptions& opts) {
             .registered = false
         };
 
-        auto register_engine = [client_id, conn, &engine, &client_sessions]() {
-            auto cs_it = client_sessions.find(client_id);
+        auto register_engine = [id_ptr, conn, &engine, &client_sessions]() {
+            uint64_t cid = *id_ptr;
+            auto cs_it = client_sessions.find(cid);
             if (cs_it == client_sessions.end() || cs_it->second.registered) return;
 
             std::string cert_fp = "local-uid";
@@ -180,7 +239,7 @@ int run_daemon(const client::CliOptions& opts) {
                     cert_fp = "tls-authenticated-peer";
                 }
             }
-            engine.register_client(client_id, {}, cert_fp);
+            engine.register_client(cid, {}, cert_fp);
             cs_it->second.registered = true;
         };
 
@@ -188,13 +247,13 @@ int run_daemon(const client::CliOptions& opts) {
             register_engine();
         }
 
-        conn->set_on_stream([client_id, setup_stream, register_engine](std::shared_ptr<transport::IStream> s) {
+        conn->set_on_stream([id_ptr, setup_stream, register_engine](std::shared_ptr<transport::IStream> s) {
             register_engine();
-            setup_stream(client_id, s);
+            setup_stream(id_ptr, s);
         });
 
         if (conn->type() != transport::TransportType::Quic) {
-            setup_stream(client_id, conn->get_stream(0));
+            setup_stream(id_ptr, conn->get_stream(0));
         }
     };
 
@@ -376,7 +435,9 @@ int run_daemon(const client::CliOptions& opts) {
                 }
 
                 if (should_evict) {
-                    if (session.registered) {
+                    if (session.registered && session.was_connected) {
+                        disconnected_clients[it->first] = now;
+                    } else if (session.registered) {
                         engine.unregister_client(it->first);
                     }
                     conn->unregister_from_reactor(reactor);
@@ -385,6 +446,16 @@ int run_daemon(const client::CliOptions& opts) {
                 } else {
                     ++it;
                 }
+            }
+        }
+
+        // Clean up disconnected clients whose resume TTL (300s) expired
+        for (auto dit = disconnected_clients.begin(); dit != disconnected_clients.end();) {
+            if (now - dit->second > std::chrono::seconds(300)) {
+                engine.unregister_client(dit->first);
+                dit = disconnected_clients.erase(dit);
+            } else {
+                ++dit;
             }
         }
     });

@@ -332,6 +332,15 @@ TEST_CASE("E2E CLI: Local 0600 AF_UNIX auto-spawn and command lifecycle") {
     });
     CHECK(res_ls2.exit_code == 0);
     CHECK(res_ls2.stdout_str.find("localtest") == std::string::npos);
+
+    // Stop auto-spawned daemon to prevent lingering background processes
+    std::filesystem::path pid_file = test_dir.path / "test.sock.pid";
+    if (std::filesystem::exists(pid_file)) {
+        pid_t pid = 0;
+        std::ifstream pf(pid_file);
+        pf >> pid;
+        if (pid > 0) kill_process(pid);
+    }
 }
 
 // ============================================================================
@@ -543,11 +552,10 @@ TEST_CASE("E2E CLI: Interactive PTY attach and clean Ctrl-b d detach") {
 
     // 2. Launch interactive attach inside a real pseudo-terminal
     std::string attach_cmd = bin + " attach -t attachtest --unix-socket " + sock.string();
-    tmux2::pty::PtyOptions pty_opts{
-        .cols = 80,
-        .rows = 24,
-        .command = attach_cmd
-    };
+    tmux2::pty::PtyOptions pty_opts;
+    pty_opts.cols = 80;
+    pty_opts.rows = 24;
+    pty_opts.command = attach_cmd;
 
     auto pty_proc_res = tmux2::pty::PtyProcess::spawn(pty_opts);
     REQUIRE(pty_proc_res.has_value());
@@ -597,4 +605,120 @@ TEST_CASE("E2E CLI: Interactive PTY attach and clean Ctrl-b d detach") {
 
     // Clean up
     (void)run_cmd(bin, {"kill-session", "-t", "attachtest", "--unix-socket", sock.string()});
+
+    // Stop auto-spawned daemon
+    std::filesystem::path pid_file = test_dir.path / "attach.sock.pid";
+    if (std::filesystem::exists(pid_file)) {
+        pid_t pid = 0;
+        std::ifstream pf(pid_file);
+        pf >> pid;
+        if (pid > 0) kill_process(pid);
+    }
+}
+
+// ============================================================================
+// Test 7: Section 5 Resumption & Reconnection
+// ============================================================================
+TEST_CASE("E2E CLI: Section 5 session resumption across re-attachments") {
+    std::string bin = get_tmux2_bin();
+    std::string dbin = get_tmux2d_bin();
+    TempDir test_dir("tmux2_recon_");
+    std::filesystem::path sock = test_dir.path / "recon.sock";
+    std::filesystem::path pid_file = test_dir.path / "recon.pid";
+
+    // 1. Start daemon explicitly
+    auto res_d = run_cmd(dbin, {
+        "--unix-socket", sock.string(),
+        "--pid-file", pid_file.string(),
+        "--daemonize"
+    });
+    REQUIRE(res_d.exit_code == 0);
+    std::this_thread::sleep_for(200ms);
+
+    REQUIRE(std::filesystem::exists(pid_file));
+    pid_t dpid = 0;
+    {
+        std::ifstream pf(pid_file);
+        pf >> dpid;
+    }
+    REQUIRE(dpid > 0);
+
+    // 2. Create session and emit content
+    auto res_new = run_cmd(bin, {
+        "new", "-d", "-s", "recontest",
+        "--unix-socket", sock.string()
+    });
+    REQUIRE(res_new.exit_code == 0);
+
+    auto res_send = run_cmd(bin, {
+        "send-keys", "-t", "recontest",
+        "--unix-socket", sock.string(),
+        "echo SECTION5_RESUME_OK", "Enter"
+    });
+    CHECK(res_send.exit_code == 0);
+    std::this_thread::sleep_for(400ms);
+
+    // 3. Attach #1 and detach cleanly
+    std::string attach_cmd = bin + " attach -t recontest --unix-socket " + sock.string();
+    {
+        tmux2::pty::PtyOptions pty_opts1;
+        pty_opts1.cols = 80;
+        pty_opts1.rows = 24;
+        pty_opts1.command = attach_cmd;
+        auto proc_res = tmux2::pty::PtyProcess::spawn(pty_opts1);
+        REQUIRE(proc_res.has_value());
+        auto proc = std::move(*proc_res);
+
+        std::array<char, 512> buf{};
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < 2s) {
+            auto r = proc.read_master(buf);
+            if (r.has_value() && *r > 0) {
+                if (std::string(buf.data(), *r).find("SECTION5_RESUME_OK") != std::string::npos) break;
+            }
+            std::this_thread::sleep_for(20ms);
+        }
+
+        (void)proc.write_master("\x02" "d");
+        for (int i = 0; i < 40; ++i) {
+            if (proc.poll_exit()) break;
+            std::this_thread::sleep_for(50ms);
+        }
+        CHECK(proc.poll_exit());
+    }
+
+    // 4. Attach #2 (re-attachment resuming session state)
+    {
+        tmux2::pty::PtyOptions pty_opts2;
+        pty_opts2.cols = 80;
+        pty_opts2.rows = 24;
+        pty_opts2.command = attach_cmd;
+        auto proc_res2 = tmux2::pty::PtyProcess::spawn(pty_opts2);
+        REQUIRE(proc_res2.has_value());
+        auto proc2 = std::move(*proc_res2);
+
+        std::string out2;
+        std::array<char, 512> buf{};
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < 2s) {
+            auto r = proc2.read_master(buf);
+            if (r.has_value() && *r > 0) {
+                out2.append(buf.data(), *r);
+                if (out2.find("SECTION5_RESUME_OK") != std::string::npos) break;
+            }
+            std::this_thread::sleep_for(20ms);
+        }
+        CHECK(out2.find("SECTION5_RESUME_OK") != std::string::npos);
+
+        (void)proc2.write_master("\x02" "d");
+        for (int i = 0; i < 40; ++i) {
+            if (proc2.poll_exit()) break;
+            std::this_thread::sleep_for(50ms);
+        }
+        CHECK(proc2.poll_exit());
+    }
+
+    // Cleanup session and daemon
+    (void)run_cmd(bin, {"kill-session", "-t", "recontest", "--unix-socket", sock.string()});
+    kill_process(dpid);
 }

@@ -29,11 +29,11 @@ enum class PtyWriteError {
 struct PtyOptions {
     uint16_t cols{80};
     uint16_t rows{24};
-    std::string term;                        // Empty = auto-detect via detect_default_term()
-    std::string cwd;                         // Empty = inherit current directory
-    std::string command;                     // If non-empty and args empty, run via /bin/sh -c
-    std::vector<std::string> args;           // If non-empty, exec directly
-    std::unordered_map<std::string, std::string> env; // Custom environment variables
+    std::string term{};                        // Empty = auto-detect via detect_default_term()
+    std::string cwd{};                         // Empty = inherit current directory
+    std::string command{};                     // If non-empty and args empty, run via /bin/sh -c
+    std::vector<std::string> args{};           // If non-empty, exec directly
+    std::unordered_map<std::string, std::string> env{}; // Custom environment variables
 };
 
 class PtyProcess {

@@ -322,13 +322,14 @@ void ServerEngine::handle_command_rpc(uint64_t client_id, const protocol::MsgCom
     auto client = get_client(client_id);
     uint32_t sid = client ? client->attached_session_id() : 0;
 
-    auto resp = CommandDsl::execute(session_manager_, req.command_dsl, req.rpc_id, sid, mock_pty_);
+    auto resp = CommandDsl::execute(session_manager_, req.command_dsl, req.rpc_id, sid, mock_pty_, client.get());
     send_to_client(client_id, resp);
 
     // If active session was modified, broadcast layout and frames
-    if (sid != 0) {
-        broadcast_session_layout(sid);
-        broadcast_session_frames(sid);
+    uint32_t new_sid = client ? client->attached_session_id() : sid;
+    if (new_sid != 0) {
+        broadcast_session_layout(new_sid);
+        broadcast_session_frames(new_sid);
     }
 }
 

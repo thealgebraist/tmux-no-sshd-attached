@@ -4,10 +4,14 @@
 #include "src/app/client_runner.hpp"
 #include "src/platform/platform.hpp"
 
+#include <csignal>
 #include <iostream>
 #include <string_view>
 
 int main(int argc, char* argv[]) {
+#if defined(SIGPIPE)
+    ::signal(SIGPIPE, SIG_IGN);
+#endif
     std::string_view prog = (argc > 0 && argv[0]) ? argv[0] : "";
     bool is_daemon = prog.ends_with("tmux2d");
 

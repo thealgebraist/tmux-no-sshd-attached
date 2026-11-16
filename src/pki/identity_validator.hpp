@@ -9,12 +9,12 @@
 namespace tmux2::pki {
 
 struct ClientIdentity {
-    std::vector<std::string> san_uris;
-    std::vector<std::string> san_dns;
-    std::vector<std::string> san_emails;
-    std::string common_name;
-    std::string cert_fingerprint;
-    std::string spki_fingerprint;
+    std::vector<std::string> san_uris{};
+    std::vector<std::string> san_dns{};
+    std::vector<std::string> san_emails{};
+    std::string common_name{};
+    std::string cert_fingerprint{};
+    std::string spki_fingerprint{};
 
     // Resolves username following spec priority:
     // 1. tmux2://user/<username> or spiffe://<trust-domain>/user/<username>

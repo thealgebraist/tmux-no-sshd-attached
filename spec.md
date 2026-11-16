@@ -127,8 +127,8 @@ All network communication uses **TLS 1.3** (RFC 8446) with mandatory mutual cert
 - Runs directly under the target user account without root privileges.
 - Supports background execution via `--daemonize`.
 - Built-in generators for service managers:
-  - **Linux:** `systemd --user` unit (`tmux2 daemon --install-service` -> `~/.config/systemd/user/tmux2.service`).
-  - **macOS:** `LaunchAgent` plist generator (`~/Library/LaunchAgents/com.tmux2.daemon.plist`).
+  - **Linux:** `systemd --user` unit (`tmux2 --print-systemd-unit` / `tmux2 daemon --print-systemd-unit` -> `~/.config/systemd/user/tmux2.service`).
+  - **macOS:** `LaunchAgent` plist generator (`tmux2 --print-launchd-plist` / `tmux2 daemon --print-launchd-plist` -> `~/Library/LaunchAgents/com.tmux2.daemon.plist`).
 - Default network listen port: UDP/TCP `8443`.
 - Local socket created with `0600` permissions accessible only to the owner UID.
 
@@ -264,7 +264,7 @@ tmux2 new-session -d -s build "make -j8"
 
 # Daemon management
 tmux2 daemon --daemonize
-tmux2 daemon --install-service     # systemd user unit or LaunchAgent plist
+tmux2 daemon --print-systemd-unit  # or --print-launchd-plist
 
 # Built-in PKI
 tmux2 pki init --host dev.example.com
@@ -362,44 +362,95 @@ tmux2/
 ├── CMakeLists.txt              # Cross-platform CMake 3.25+ build definition
 ├── spec.md                     # Technical specification (this document)
 ├── include/                    # Public API / shared headers
-└── src/
-    ├── reactor/                # Single-threaded Reactor (epoll / kqueue / timers)
-    │   ├── reactor.hpp/.cpp
-    │   ├── epoll_reactor.cpp   # Linux epoll backend
-    │   └── kqueue_reactor.cpp  # macOS kqueue + poll fallback backend
-    ├── pki/                    # OpenSSL 3.5+ Ed25519 X.509v3 PKI engine
-    │   ├── pki.hpp/.cpp
-    │   └── profile.hpp/.cpp
-    ├── config/                 # toml++ configuration parsers
-    │   ├── config.hpp/.cpp
-    │   └── server_config.hpp/.cpp
-    ├── protocol/               # Zero-codegen binary wire codec & cell models
-    │   ├── codec.hpp/.cpp
-    │   ├── messages.hpp
-    │   └── cell.hpp
-    ├── pty/                    # Cross-platform PTY management & terminfo
-    │   ├── pty_process.hpp/.cpp
-    │   └── terminfo.hpp/.cpp
-    ├── vte/                    # libvterm C++23 wrapper & compressed scrollback
-    │   ├── vte_wrapper.hpp/.cpp
-    │   ├── scrollback_buffer.hpp/.cpp
-    │   └── dirty_tracker.hpp/.cpp
-    ├── transport/              # Transport abstractions (OpenSSL QUIC / TCP / AF_UNIX)
-    │   ├── transport.hpp
-    │   ├── quic_transport.hpp/.cpp
-    │   ├── tls_tcp_transport.hpp/.cpp
-    │   └── unix_transport.hpp/.cpp
-    ├── server/                 # Server daemon engine, sessions, windows, layouts
-    │   ├── server.hpp/.cpp
-    │   ├── session.hpp/.cpp
-    │   ├── window.hpp/.cpp
-    │   └── layout.hpp/.cpp
-    ├── client/                 # TUI client, prefix engine, copy mode, renderer
-    │   ├── client.hpp/.cpp
-    │   ├── raw_tty.hpp/.cpp
-    │   ├── renderer.hpp/.cpp
-    │   └── copy_mode.hpp/.cpp
-    └── main.cpp                # Unified entrypoint (subcommands: client, daemon, pki)
+│   └── tmux2/
+│       ├── config/
+│       │   └── config.hpp
+│       ├── pki/
+│       │   └── pki.hpp
+│       └── reactor/            # Single-threaded Reactor abstractions
+│           ├── backend.hpp
+│           ├── epoll_backend.hpp
+│           ├── frame_coalescer.hpp
+│           ├── kqueue_backend.hpp
+│           ├── poll_backend.hpp
+│           ├── reactor.hpp
+│           ├── signal_handler.hpp
+│           ├── timer_heap.hpp
+│           └── types.hpp
+├── src/
+│   ├── app/                    # Daemon runner, client runner & CLI PKI commands
+│   │   ├── client_runner.hpp/.cpp
+│   │   ├── daemon_runner.hpp/.cpp
+│   │   └── pki_commands.hpp/.cpp
+│   ├── client/                 # TUI client, keybindings, copy mode, renderer
+│   │   ├── client.hpp
+│   │   ├── client_app.hpp/.cpp
+│   │   ├── cli_parser.hpp/.cpp
+│   │   ├── copy_mode.hpp/.cpp
+│   │   ├── input_parser.hpp/.cpp
+│   │   ├── keybindings.hpp/.cpp
+│   │   ├── reconnect_buffer.hpp/.cpp
+│   │   ├── renderer.hpp/.cpp
+│   │   ├── session_chooser.hpp/.cpp
+│   │   └── tty_raw.hpp/.cpp
+│   ├── config/                 # toml++ configuration parsers
+│   │   ├── config.hpp
+│   │   ├── config_parser.hpp/.cpp
+│   │   └── config_types.hpp
+│   ├── pki/                    # OpenSSL 3.5+ Ed25519 X.509v3 PKI engine
+│   │   ├── cert_generator.hpp/.cpp
+│   │   ├── crypto_utils.hpp/.cpp
+│   │   ├── identity_validator.hpp/.cpp
+│   │   ├── pki.hpp
+│   │   ├── pki_manager.hpp/.cpp
+│   │   └── raii.hpp
+│   ├── platform/               # OS daemonization, systemd & launchd generators
+│   │   └── platform.hpp/.cpp
+│   ├── protocol/               # Zero-codegen binary wire codec & cell models
+│   │   ├── cell.hpp/.cpp
+│   │   ├── codec.hpp
+│   │   ├── compression.hpp/.cpp
+│   │   ├── frame.hpp
+│   │   ├── messages.hpp/.cpp
+│   │   └── protocol.hpp
+│   ├── pty/                    # Cross-platform PTY management & terminfo
+│   │   ├── pty.hpp
+│   │   ├── pty_process.hpp/.cpp
+│   │   └── terminfo.hpp/.cpp
+│   ├── reactor/                # Reactor implementation
+│   │   └── reactor.cpp
+│   ├── server/                 # Server daemon engine, sessions, windows, layouts
+│   │   ├── client_state.hpp/.cpp
+│   │   ├── command_dsl.hpp/.cpp
+│   │   ├── layout.hpp/.cpp
+│   │   ├── pane.hpp/.cpp
+│   │   ├── server_engine.hpp/.cpp
+│   │   ├── session.hpp/.cpp
+│   │   ├── session_manager.hpp/.cpp
+│   │   └── window.hpp/.cpp
+│   ├── transport/              # Transport abstractions (OpenSSL QUIC / TCP / AF_UNIX)
+│   │   ├── happy_eyeballs.hpp/.cpp
+│   │   ├── quic_transport.hpp/.cpp
+│   │   ├── tls_tcp_transport.hpp/.cpp
+│   │   ├── tls_utils.hpp/.cpp
+│   │   ├── transport.hpp
+│   │   └── unix_transport.hpp/.cpp
+│   ├── vte/                    # libvterm C++23 wrapper & compressed scrollback
+│   │   ├── dirty_tracker.hpp/.cpp
+│   │   ├── scrollback_buffer.hpp/.cpp
+│   │   ├── vte.hpp
+│   │   └── vte_wrapper.hpp/.cpp
+│   └── main.cpp                # Unified entrypoint (subcommands: client, daemon, pki)
+└── tests/                      # Doctest unit & end-to-end test suites
+    ├── test_client.cpp
+    ├── test_e2e_cli.cpp
+    ├── test_e2e_stack.cpp
+    ├── test_pki_config.cpp
+    ├── test_protocol.cpp
+    ├── test_pty_vte.cpp
+    ├── test_reactor.cpp
+    ├── test_server.cpp
+    └── test_transport.cpp
 ```
 
 ### 7.3 Phased Roadmap

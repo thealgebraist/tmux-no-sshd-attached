@@ -49,6 +49,9 @@ std::expected<void, std::string> set_random_serial(X509* cert) {
 }
 
 const EVP_MD* get_signing_md(const EVP_PKEY* pkey) {
+    if (!pkey) {
+        return nullptr;
+    }
     if (EVP_PKEY_is_a(pkey, "ED25519") || EVP_PKEY_base_id(pkey) == EVP_PKEY_ED25519) {
         return nullptr; // Ed25519 does not take an external digest
     }
@@ -60,6 +63,10 @@ std::expected<GeneratedCertificate, std::string> finalize_cert(
     UniqueX509 cert,
     const EVP_PKEY* signing_key
 ) {
+    if (!pkey || !cert || !signing_key) {
+        return std::unexpected("Null private key, certificate, or signing key in finalize_cert");
+    }
+
     const EVP_MD* md = get_signing_md(signing_key);
     if (X509_sign(cert.get(), const_cast<EVP_PKEY*>(signing_key), md) <= 0) {
         return std::unexpected(std::format("Failed to sign certificate: {}", get_openssl_error()));
@@ -153,7 +160,8 @@ std::expected<GeneratedCertificate, std::string> generate_ca(const CaOptions& op
     if (auto res = add_extension(cert.get(), &ctx, NID_subject_key_identifier, "hash"); !res) return std::unexpected(res.error());
     if (auto res = add_extension(cert.get(), &ctx, NID_authority_key_identifier, "keyid:always,issuer"); !res) return std::unexpected(res.error());
 
-    return finalize_cert(std::move(ca_key), std::move(cert), ca_key.get());
+    const EVP_PKEY* signing_key = ca_key.get();
+    return finalize_cert(std::move(ca_key), std::move(cert), signing_key);
 }
 
 std::expected<GeneratedCertificate, std::string> generate_server_cert(

@@ -1,4 +1,5 @@
 #include "src/server/command_dsl.hpp"
+#include "src/server/client_state.hpp"
 
 #include <charconv>
 #include <sstream>
@@ -173,7 +174,8 @@ protocol::MsgCommandRpcResp CommandDsl::execute(
     std::string_view command_str,
     uint64_t rpc_id,
     uint32_t current_session_id,
-    bool mock_pty) {
+    bool mock_pty,
+    ClientState* client) {
     protocol::MsgCommandRpcResp resp;
     resp.rpc_id = rpc_id;
     resp.exit_code = 0;
@@ -246,7 +248,24 @@ protocol::MsgCommandRpcResp CommandDsl::execute(
         if (detach_others) {
             auto others = s->attached_clients();
             for (const auto& att : others) {
-                s->detach_client(att.client_id);
+                if (!client || att.client_id != client->client_id()) {
+                    s->detach_client(att.client_id);
+                }
+            }
+        }
+        if (client) {
+            s->attach_client(
+                client->client_id(),
+                read_only,
+                client->cols() > 0 ? client->cols() : 80,
+                client->rows() > 0 ? client->rows() : 24,
+                detach_others
+            );
+            client->set_attached_session_id(s->session_id());
+            client->set_read_only(read_only);
+        } else if (read_only) {
+            for (const auto& att : s->attached_clients()) {
+                s->attach_client(att.client_id, true, att.cols, att.rows);
             }
         }
         return resp;

@@ -510,6 +510,7 @@ TEST_CASE("E2E-1: QUIC mTLS 1.3 Full Multiplexing Lifecycle (real PTY shell, mul
     // 4. Create session "alpha" (attached)
     MsgNewSessionReq new_alpha;
     new_alpha.name = "alpha";
+    new_alpha.command = "/bin/sh";
     new_alpha.detached = false;
     client.send(new_alpha);
 
@@ -726,7 +727,7 @@ TEST_CASE("E2E-2: Happy Eyeballs TCP TLS 1.3 Fallback & Strict mTLS Rejection ac
         auto hello_resp = client.wait_for_msg<MsgServerHello>();
         REQUIRE(hello_resp.has_value());
 
-        client.send(MsgNewSessionReq{.name = "tcp_sess", .detached = false});
+        client.send(MsgNewSessionReq{.name = "tcp_sess", .command = "/bin/sh", .detached = false});
         auto new_resp = client.wait_for_msg<MsgNewSessionResp>();
         REQUIRE(new_resp.has_value());
         CHECK(new_resp->success);
@@ -820,7 +821,7 @@ TEST_CASE("E2E-3: Local 0600 AF_UNIX Full Stack (stat 0600, peer UID, multi-pane
     client.send(MsgClientHello{.protocol_version = 1});
     REQUIRE(client.wait_for_msg<MsgServerHello>().has_value());
 
-    client.send(MsgNewSessionReq{.name = "unix_session", .detached = false});
+    client.send(MsgNewSessionReq{.name = "unix_session", .command = "/bin/sh", .detached = false});
     auto new_resp = client.wait_for_msg<MsgNewSessionResp>();
     REQUIRE(new_resp.has_value());
     CHECK(new_resp->success);
@@ -887,7 +888,7 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
         CHECK_FALSE(resume_tok.empty());
         client_app.handle_server_message(*hello);
 
-        c1.send(MsgNewSessionReq{.name = "recon_sess", .detached = false});
+        c1.send(MsgNewSessionReq{.name = "recon_sess", .command = "/bin/sh", .detached = false});
         auto n_resp = c1.wait_for_msg<MsgNewSessionResp>();
         REQUIRE(n_resp.has_value());
         CHECK(n_resp->success);
@@ -1081,7 +1082,7 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
     uint64_t c1_id = h1->assigned_client_id;
     CHECK(c1_id == 1);
 
-    c1.send(MsgNewSessionReq{.name = "shared", .detached = false});
+    c1.send(MsgNewSessionReq{.name = "shared", .command = "/bin/sh", .detached = false});
     auto n1 = c1.wait_for_msg<MsgNewSessionResp>();
     REQUIRE(n1.has_value());
     CHECK(n1->success);
@@ -1244,7 +1245,7 @@ TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, C
     REQUIRE(hello_resp.has_value());
 
     // 1. Create sessions "work" (attached) and "infra" (detached)
-    client.send_msg(MsgNewSessionReq{.name = "work", .detached = false});
+    client.send_msg(MsgNewSessionReq{.name = "work", .command = "/bin/sh", .detached = false});
     auto work_resp = client.wait_for_inbound<MsgNewSessionResp>();
     REQUIRE(work_resp.has_value());
     CHECK(work_resp->success);
@@ -1258,7 +1259,7 @@ TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, C
     REQUIRE(work_layout.has_value());
 
     // Split window in "work" so we have 2 panes for testing split-border drag resize and mouse click focus
-    client.send_msg(MsgCommandRpcReq{.rpc_id = 50, .command_dsl = "split-window -h"});
+    client.send_msg(MsgCommandRpcReq{.rpc_id = 50, .command_dsl = "split-window -h /bin/sh"});
     auto split_resp = client.wait_for_inbound<MsgCommandRpcResp>();
     REQUIRE(split_resp.has_value());
     CHECK(split_resp->exit_code == 0);
@@ -1267,7 +1268,7 @@ TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, C
     REQUIRE(split_layout.has_value());
 
     // Create session "infra" (detached)
-    client.send_msg(MsgNewSessionReq{.name = "infra", .detached = true});
+    client.send_msg(MsgNewSessionReq{.name = "infra", .command = "/bin/sh", .detached = true});
     auto infra_resp = client.wait_for_inbound<MsgNewSessionResp>();
     REQUIRE(infra_resp.has_value());
     CHECK(infra_resp->success);
@@ -1320,23 +1321,29 @@ TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, C
 
     // 3. Copy Mode with >100 lines real PTY scrollback slice fetch + OSC 52 yank
     {
-        // Generate >100 lines of real PTY output
-        {
-            std::lock_guard<std::recursive_mutex> lock(runner.mutex());
-            auto s = runner.engine().session_manager().find_session(work_sid);
-            REQUIRE(s != nullptr);
-            auto win = s->active_window();
-            REQUIRE(win != nullptr);
-            auto pane = win->active_pane();
-            REQUIRE(pane != nullptr);
-            pane->write_input("for i in $(seq 1 150); do echo \"UX_LOG_LINE_$i\"; done\n");
-        }
+        // Generate >100 lines of real PTY output (retry if Readline TCSAFLUSH ate early write)
+        std::optional<ProtocolMessage> line_diff;
+        for (int retry = 0; retry < 5; ++retry) {
+            {
+                std::lock_guard<std::recursive_mutex> lock(runner.mutex());
+                auto s = runner.engine().session_manager().find_session(work_sid);
+                REQUIRE(s != nullptr);
+                auto win = s->active_window();
+                REQUIRE(win != nullptr);
+                auto pane = win->active_pane();
+                REQUIRE(pane != nullptr);
+                pane->write_input("for i in $(seq 1 150); do echo \"UX_LOG_LINE_$i\"; done\n");
+            }
 
-        // Wait for output to be processed by VTE
-        auto line_diff = client.wait_for_matching_inbound([](const ProtocolMessage& m) {
-            return std::holds_alternative<MsgFrameDiff>(m) &&
-                   frame_diff_contains(std::get<MsgFrameDiff>(m), "UX_LOG_LINE_150");
-        }, 5000ms);
+            // Wait for output to be processed by VTE
+            line_diff = client.wait_for_matching_inbound([](const ProtocolMessage& m) {
+                return std::holds_alternative<MsgFrameDiff>(m) &&
+                       frame_diff_contains(std::get<MsgFrameDiff>(m), "UX_LOG_LINE_150");
+            }, 600ms);
+            if (line_diff.has_value()) {
+                break;
+            }
+        }
         REQUIRE(line_diff.has_value());
 
         // Configure renderer pane rects

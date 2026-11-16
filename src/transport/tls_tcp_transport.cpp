@@ -162,7 +162,14 @@ TcpTlsConnection::TcpTlsConnection(
     : m_ssl(std::move(ssl)),
       m_fd(socket_fd),
       m_ctx(std::move(ctx_holder)),
-      m_is_server(is_server) {}
+      m_is_server(is_server) {
+#if defined(SO_NOSIGPIPE)
+    if (m_fd >= 0) {
+        int opt = 1;
+        ::setsockopt(m_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    }
+#endif
+}
 
 TcpTlsConnection::~TcpTlsConnection() {
     close();
@@ -440,6 +447,11 @@ std::expected<std::unique_ptr<TcpTlsListener>, std::string> TcpTlsListener::crea
         return std::unexpected("Failed to create TCP socket: " + std::string(strerror(errno)));
     }
 
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
+
     int reuse = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
@@ -493,6 +505,11 @@ std::expected<std::shared_ptr<IConnection>, std::error_code> TcpTlsListener::acc
 
     int nodelay = 1;
     ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
     UniqueSsl ssl(SSL_new(m_ctx->get()));
     if (!ssl) {
@@ -573,6 +590,11 @@ std::expected<std::shared_ptr<TcpTlsConnection>, std::string> TcpTlsConnector::c
     if (fd < 0) {
         return std::unexpected("Failed to create TCP socket: " + std::string(strerror(errno)));
     }
+
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
     int nodelay = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));

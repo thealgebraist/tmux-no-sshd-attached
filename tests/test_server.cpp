@@ -759,6 +759,13 @@ TEST_CASE("Command DSL") {
 
         auto att_bad = CommandDsl::execute(mgr, "attach-session -t nonexistent", 3, 0, true);
         CHECK(att_bad.exit_code == 1);
+
+        ClientState client(42, {}, "fp");
+        auto att_r = CommandDsl::execute(mgr, "attach-session -t att-sess -r", 4, 0, true, &client);
+        CHECK(att_r.exit_code == 0);
+        CHECK(client.is_read_only() == true);
+        CHECK(client.attached_session_id() == s->session_id());
+        CHECK(s->attached_client_count() == 1);
     }
 }
 

@@ -16,15 +16,15 @@ struct CaOptions {
 struct ServerCertOptions {
     std::string common_name = "tmux2 Server";
     std::string organization = "tmux2";
-    std::vector<std::string> hosts; // e.g. "dev.example.com", "127.0.0.1", "::1", "localhost"
+    std::vector<std::string> hosts{}; // e.g. "dev.example.com", "127.0.0.1", "::1", "localhost"
     int validity_days = 365;        // ~1 year
 };
 
 struct ClientCertOptions {
     std::string common_name = "tmux2 Client";
     std::string organization = "tmux2";
-    std::string user_name;          // e.g. "alice" -> SAN URI tmux2://user/alice
-    std::vector<std::string> custom_san_uris; // e.g. "spiffe://domain/user/alice"
+    std::string user_name{};          // e.g. "alice" -> SAN URI tmux2://user/alice
+    std::vector<std::string> custom_san_uris{}; // e.g. "spiffe://domain/user/alice"
     int validity_days = 365;        // ~1 year
 };
 

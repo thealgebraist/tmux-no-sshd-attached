@@ -82,7 +82,6 @@ private:
     bool mock_pty_{false};
 
     uint64_t next_server_seq_{1};
-    uint64_t next_assigned_client_id_{1};
     std::array<uint8_t, 32> hmac_key_{};
 };
 

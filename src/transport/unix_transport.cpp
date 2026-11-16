@@ -154,11 +154,24 @@ void UnixStream::deliver_data(std::span<const std::byte> data) {
 UnixConnection::UnixConnection(int socket_fd, bool is_server)
     : m_fd(socket_fd), m_is_server(is_server) {
     if (m_fd >= 0) {
+#if defined(SO_NOSIGPIPE)
+        int opt = 1;
+        ::setsockopt(m_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
+
+#if defined(__linux__)
         ucred cred{};
         socklen_t len = sizeof(cred);
         if (::getsockopt(m_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
             m_peer_uid = cred.uid;
         }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        uid_t euid{};
+        gid_t egid{};
+        if (::getpeereid(m_fd, &euid, &egid) == 0) {
+            m_peer_uid = euid;
+        }
+#endif
     }
 }
 
@@ -402,6 +415,11 @@ std::expected<std::unique_ptr<UnixListener>, std::string> UnixListener::create(
         return std::unexpected("Failed to create AF_UNIX socket: " + std::string(strerror(errno)));
     }
 
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
+
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (socket_path.string().size() >= sizeof(addr.sun_path)) {
@@ -448,6 +466,11 @@ std::expected<std::shared_ptr<IConnection>, std::error_code> UnixListener::accep
         }
         return std::unexpected(std::make_error_code(std::errc::io_error));
     }
+
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
     int flags = ::fcntl(client_fd, F_GETFL);
     ::fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
@@ -514,6 +537,11 @@ std::expected<std::shared_ptr<UnixConnection>, std::string> UnixConnector::conne
     if (fd < 0) {
         return std::unexpected("Failed to create AF_UNIX socket: " + std::string(strerror(errno)));
     }
+
+#if defined(SO_NOSIGPIPE)
+    int nosigpipe = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
     int flags = ::fcntl(fd, F_GETFL);
     ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);

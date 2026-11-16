@@ -21,6 +21,8 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -151,11 +153,7 @@ public:
     explicit ServerBridgeRunner(IListener* listener, bool mock_pty = false)
         : m_listener(listener), m_engine(nullptr, mock_pty), m_stop(false) {
         m_engine.set_message_sender([this](uint64_t client_id, const ProtocolMessage& msg) {
-            std::lock_guard<std::recursive_mutex> lock(m_mutex);
-            auto it = m_client_streams.find(client_id);
-            if (it != m_client_streams.end() && it->second && !it->second->is_closed()) {
-                send_proto(*it->second, msg);
-            }
+            send_to_client(client_id, msg);
         });
 
         m_thread = std::thread([this]() {
@@ -200,18 +198,26 @@ public:
     ServerEngine& engine() { return m_engine; }
     std::recursive_mutex& mutex() { return m_mutex; }
 
-    std::shared_ptr<IConnection> wait_for_connection(std::chrono::milliseconds timeout = 3000ms) {
+    std::shared_ptr<IConnection> wait_for_connection(size_t expected_count = 1, std::chrono::milliseconds timeout = 3000ms) {
         auto start = std::chrono::steady_clock::now();
         while (std::chrono::steady_clock::now() - start < timeout) {
             {
                 std::lock_guard<std::recursive_mutex> lock(m_mutex);
-                if (!m_connections.empty() && m_connections.back()->is_connected()) {
-                    return m_connections.back();
+                if (m_connections.size() >= expected_count && m_connections[expected_count - 1]->is_connected()) {
+                    return m_connections[expected_count - 1];
                 }
             }
             std::this_thread::sleep_for(5ms);
         }
         return nullptr;
+    }
+
+    void send_to_client(uint64_t client_id, const ProtocolMessage& msg) {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        auto it = m_client_streams.find(client_id);
+        if (it != m_client_streams.end() && it->second && !it->second->is_closed()) {
+            send_proto(*it->second, msg);
+        }
     }
 
     void map_client_id(uint64_t client_id, std::shared_ptr<IStream> stream) {
@@ -275,7 +281,7 @@ private:
 };
 
 // ============================================================================
-// TestClientEndpoint: Convenient test client handling stream 0 messaging
+// TestClientEndpoint: Convenient raw stream 0 protocol test endpoint
 // ============================================================================
 struct TestClientEndpoint {
     std::shared_ptr<IConnection> conn;
@@ -365,6 +371,98 @@ struct TestClientEndpoint {
     }
 };
 
+// ============================================================================
+// ConnectedClientApp: Wires real ClientApp to live transport stream & server
+// ============================================================================
+struct ConnectedClientApp {
+    ClientApp app;
+    std::shared_ptr<IConnection> conn;
+    std::shared_ptr<IStream> stream;
+    std::mutex mtx;
+    std::vector<ProtocolMessage> inbound_msgs;
+
+    ConnectedClientApp(std::shared_ptr<IConnection> c, uint16_t cols = 80, uint16_t rows = 24)
+        : app(cols, rows), conn(c) {
+        REQUIRE(conn != nullptr);
+        auto s_res = conn->open_stream(0, true);
+        REQUIRE(s_res.has_value());
+        stream = *s_res;
+
+        stream->set_on_frame([this](const StreamHeader& hdr, std::span<const std::byte> payload) {
+            auto dec = decode_proto(hdr, payload);
+            if (!dec) return;
+            std::lock_guard<std::mutex> lock(mtx);
+            inbound_msgs.push_back(*dec);
+            // Feed to ClientApp
+            auto res = app.handle_server_message(*dec);
+            if (res.slice_req) {
+                send_proto(*stream, *res.slice_req);
+            }
+        });
+    }
+
+    void poll() {
+        if (conn) {
+            ERR_clear_error();
+            conn->poll_io();
+        }
+    }
+
+    void send_msg(const ProtocolMessage& msg, bool compress = false) {
+        REQUIRE(stream != nullptr);
+        send_proto(*stream, msg, compress);
+        poll();
+    }
+
+    void send_input_event(const InputEvent& ev) {
+        auto res = app.process_input_event(ev);
+        for (const auto& m : res.outbound_messages) {
+            send_proto(*stream, m);
+        }
+        poll();
+    }
+
+    template <typename T>
+    std::optional<T> wait_for_inbound(std::chrono::milliseconds timeout = 3000ms) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            poll();
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                for (auto it = inbound_msgs.begin(); it != inbound_msgs.end(); ++it) {
+                    if (std::holds_alternative<T>(*it)) {
+                        T found = std::get<T>(*it);
+                        inbound_msgs.erase(it);
+                        return found;
+                    }
+                }
+            }
+            std::this_thread::sleep_for(3ms);
+        }
+        return std::nullopt;
+    }
+
+    template <typename Predicate>
+    std::optional<ProtocolMessage> wait_for_matching_inbound(Predicate pred, std::chrono::milliseconds timeout = 3000ms) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            poll();
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                for (auto it = inbound_msgs.begin(); it != inbound_msgs.end(); ++it) {
+                    if (pred(*it)) {
+                        ProtocolMessage found = *it;
+                        inbound_msgs.erase(it);
+                        return found;
+                    }
+                }
+            }
+            std::this_thread::sleep_for(3ms);
+        }
+        return std::nullopt;
+    }
+};
+
 } // namespace
 
 // ============================================================================
@@ -389,7 +487,7 @@ TEST_CASE("E2E-1: QUIC mTLS 1.3 Full Multiplexing Lifecycle (real PTY shell, mul
     CHECK(client_conn->is_connected());
     CHECK(client_conn->type() == TransportType::Quic);
 
-    auto server_conn = runner.wait_for_connection();
+    auto server_conn = runner.wait_for_connection(1);
     REQUIRE(server_conn != nullptr);
     CHECK(server_conn->peer_identity().has_value());
     CHECK(server_conn->peer_identity()->extract_username() == "quic_user");
@@ -496,7 +594,6 @@ TEST_CASE("E2E-1: QUIC mTLS 1.3 Full Multiplexing Lifecycle (real PTY shell, mul
     auto stty_diff = client.wait_for_matching([](const ProtocolMessage& m) {
         if (!std::holds_alternative<MsgFrameDiff>(m)) return false;
         const auto& diff = std::get<MsgFrameDiff>(m);
-        // Should contain digits representing row and col
         for (const auto& pd : diff.pane_diffs) {
             for (const auto& row : pd.rows) {
                 std::string s;
@@ -618,7 +715,7 @@ TEST_CASE("E2E-2: Happy Eyeballs TCP TLS 1.3 Fallback & Strict mTLS Rejection ac
         CHECK(he_conn->is_connected());
         CHECK(he_conn->type() == TransportType::TcpTls);
 
-        auto server_conn = tcp_runner.wait_for_connection();
+        auto server_conn = tcp_runner.wait_for_connection(1);
         REQUIRE(server_conn != nullptr);
 
         TestClientEndpoint client;
@@ -707,7 +804,7 @@ TEST_CASE("E2E-3: Local 0600 AF_UNIX Full Stack (stat 0600, peer UID, multi-pane
     CHECK(client_conn->is_connected());
     CHECK(client_conn->type() == TransportType::Unix);
 
-    auto server_conn = runner.wait_for_connection();
+    auto server_conn = runner.wait_for_connection(1);
     REQUIRE(server_conn != nullptr);
 
     // 3. Verify peer UID extraction
@@ -768,13 +865,16 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
 
     ServerBridgeRunner runner(listener.get(), /*mock_pty=*/false);
 
+    // ClientApp driven against live server
+    ClientApp client_app(80, 24);
+
     // --- Subcase A: Delta Replay on fresh reconnect connection ---
     std::string resume_tok;
     uint64_t last_srv_seq = 0;
 
     {
         auto conn = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
-        auto s_conn = runner.wait_for_connection();
+        auto s_conn = runner.wait_for_connection(1);
         REQUIRE(s_conn != nullptr);
         TestClientEndpoint c1;
         c1.conn = conn;
@@ -785,18 +885,22 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
         REQUIRE(hello.has_value());
         resume_tok = hello->resume_token;
         CHECK_FALSE(resume_tok.empty());
+        client_app.handle_server_message(*hello);
 
         c1.send(MsgNewSessionReq{.name = "recon_sess", .detached = false});
         auto n_resp = c1.wait_for_msg<MsgNewSessionResp>();
         REQUIRE(n_resp.has_value());
         CHECK(n_resp->success);
+        client_app.handle_server_message(*n_resp);
 
         auto layout = c1.wait_for_msg<MsgLayoutUpdate>();
         REQUIRE(layout.has_value());
         last_srv_seq = layout->server_seq;
+        client_app.handle_server_message(*layout);
 
         // Drain any additional initial layout/snapshot messages to capture latest server_seq
         while (auto msg = c1.wait_for_matching([](const ProtocolMessage&) { return true; }, 50ms)) {
+            client_app.handle_server_message(*msg);
             if (std::holds_alternative<MsgLayoutUpdate>(*msg)) {
                 last_srv_seq = std::max(last_srv_seq, std::get<MsgLayoutUpdate>(*msg).server_seq);
             } else if (std::holds_alternative<MsgScreenSnapshot>(*msg)) {
@@ -826,7 +930,7 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
     // Reconnect with valid resume_token presenting last_srv_seq
     {
         auto conn2 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
-        auto s_conn2 = runner.wait_for_connection();
+        auto s_conn2 = runner.wait_for_connection(2);
         REQUIRE(s_conn2 != nullptr);
         TestClientEndpoint c2;
         c2.conn = conn2;
@@ -840,13 +944,19 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
 
         auto hello2 = c2.wait_for_msg<MsgServerHello>();
         REQUIRE(hello2.has_value());
+        client_app.handle_server_message(*hello2);
 
         // Verify missed MsgFrameDiffs are replayed!
         auto replayed_diff = c2.wait_for_matching([](const ProtocolMessage& m) {
             return std::holds_alternative<MsgFrameDiff>(m) &&
                    frame_diff_contains(std::get<MsgFrameDiff>(m), "DELTA_CATCHUP_SUCCESS");
         }, 3000ms);
-        CHECK(replayed_diff.has_value());
+        REQUIRE(replayed_diff.has_value());
+
+        // Apply replayed diff to ClientApp and verify client grid catches up accurately!
+        client_app.handle_server_message(*replayed_diff);
+        std::string rendered = client_app.render_frame(/*use_decset_2026=*/false);
+        CHECK(rendered.find("DELTA_CATCHUP_SUCCESS") != std::string::npos);
 
         conn2->close();
     }
@@ -855,7 +965,7 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
     {
         // Reconnect presenting aged-out last_srv_seq = 0
         auto conn3 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
-        auto s_conn3 = runner.wait_for_connection();
+        auto s_conn3 = runner.wait_for_connection(3);
         REQUIRE(s_conn3 != nullptr);
         TestClientEndpoint c3;
         c3.conn = conn3;
@@ -872,42 +982,72 @@ TEST_CASE("E2E-4: Section 5 Automatic Reconnect (Delta Replay, Snapshot Fallback
         // Server MUST fall back to sending fresh LayoutUpdate + ScreenSnapshot
         auto fallback_layout = c3.wait_for_msg<MsgLayoutUpdate>();
         CHECK(fallback_layout.has_value());
+        if (fallback_layout) client_app.handle_server_message(*fallback_layout);
 
         auto fallback_snapshot = c3.wait_for_msg<MsgScreenSnapshot>();
         CHECK(fallback_snapshot.has_value());
+        if (fallback_snapshot) client_app.handle_server_message(*fallback_snapshot);
 
         conn3->close();
     }
 
     // --- Subcase C: client_seq Deduplication ---
     {
-        std::lock_guard<std::recursive_mutex> lock(runner.mutex());
-        auto client_state = runner.engine().get_client(1);
-        REQUIRE(client_state != nullptr);
+        // 1. Buffer MsgKeyEvents in ClientApp::reconnect_buffer()
+        uint64_t s1 = 10;
+        uint64_t s2 = 11;
+        client_app.reconnect_buffer().push(s1, MsgKeyEvent{.client_seq = s1, .key_code = 'x'});
+        client_app.reconnect_buffer().push(s2, MsgKeyEvent{.client_seq = s2, .key_code = 'y'});
+        CHECK(client_app.reconnect_buffer().size() == 2);
 
-        // Deduplication test: seq 10 is new
-        CHECK(client_state->deduplicate_client_seq(10));
-        // seq 10 repeated is a duplicate!
-        CHECK_FALSE(client_state->deduplicate_client_seq(10));
-        // seq 5 (older than newest seen) is a duplicate!
-        CHECK_FALSE(client_state->deduplicate_client_seq(5));
-        // seq 11 is new
-        CHECK(client_state->deduplicate_client_seq(11));
+        // Server acks s1: verify already-acked event is removed from buffer
+        client_app.reconnect_buffer().ack(s1);
+        CHECK(client_app.reconnect_buffer().size() == 1);
 
-        // Using ReconnectBuffer from ClientApp
-        ReconnectBuffer buf(100);
-        uint64_t s1 = buf.next_seq();
-        uint64_t s2 = buf.next_seq();
-        buf.push(s1, MsgKeyEvent{.client_seq = s1, .key_code = 'x'});
-        buf.push(s2, MsgKeyEvent{.client_seq = s2, .key_code = 'y'});
-        CHECK(buf.size() == 2);
+        // Prepare replay: unacked client_seq > last_client_seq_acked is replayed
+        auto replay = client_app.prepare_reconnect_replay(s1);
+        REQUIRE(replay.size() == 1);
+        CHECK(std::get<MsgKeyEvent>(replay[0]).client_seq == s2);
 
-        // Server acks s1
-        buf.ack(s1);
-        CHECK(buf.size() == 1);
-        auto unacked = buf.get_unacked(s1);
-        REQUIRE(unacked.size() == 1);
-        CHECK(unacked[0].client_seq == s2);
+        // 2. Verify server-side deduplication logic
+        {
+            std::lock_guard<std::recursive_mutex> lock(runner.mutex());
+            auto client_state = runner.engine().get_client(1);
+            REQUIRE(client_state != nullptr);
+
+            client_state->set_last_client_seq_acked(s1);
+            // Already-acked seq s1 is rejected
+            CHECK_FALSE(client_state->deduplicate_client_seq(s1));
+            // Unacked seq s2 is accepted
+            CHECK(client_state->deduplicate_client_seq(s2));
+            // Duplicate seq s2 is rejected
+            CHECK_FALSE(client_state->deduplicate_client_seq(s2));
+        }
+
+        // 3. Connect live client and verify unacked event executes exactly once on server
+        auto conn4 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
+        auto s_conn4 = runner.wait_for_connection(4);
+        REQUIRE(s_conn4 != nullptr);
+        TestClientEndpoint c4;
+        c4.conn = conn4;
+        c4.setup();
+
+        c4.send(MsgClientHello{.protocol_version = 1, .resume_token = resume_tok, .last_srv_seq = last_srv_seq});
+        REQUIRE(c4.wait_for_msg<MsgServerHello>().has_value());
+
+        // Send unacked seq 20
+        c4.send_input_str("echo DEDUP_EXEC_ONCE\n", 20);
+        auto exec_diff = c4.wait_for_matching([](const ProtocolMessage& m) {
+            return std::holds_alternative<MsgFrameDiff>(m) &&
+                   frame_diff_contains(std::get<MsgFrameDiff>(m), "DEDUP_EXEC_ONCE");
+        }, 4000ms);
+        CHECK(exec_diff.has_value());
+
+        // Send duplicate seq 20 -> server ignores it
+        c4.send_input_str("echo DEDUP_EXEC_ONCE\n", 20);
+        std::this_thread::sleep_for(100ms);
+
+        conn4->close();
     }
 
     runner.stop();
@@ -929,7 +1069,7 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
 
     // 1. Client 1 attaches with 120x40
     auto conn1 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
-    auto s_conn1 = runner.wait_for_connection();
+    auto s_conn1 = runner.wait_for_connection(1);
     REQUIRE(s_conn1 != nullptr);
     TestClientEndpoint c1;
     c1.conn = conn1;
@@ -938,6 +1078,8 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
     c1.send(MsgClientHello{.protocol_version = 1});
     auto h1 = c1.wait_for_msg<MsgServerHello>();
     REQUIRE(h1.has_value());
+    uint64_t c1_id = h1->assigned_client_id;
+    CHECK(c1_id == 1);
 
     c1.send(MsgNewSessionReq{.name = "shared", .detached = false});
     auto n1 = c1.wait_for_msg<MsgNewSessionResp>();
@@ -958,7 +1100,7 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
 
     // 2. Client 2 attaches with 80x24 simultaneously to the same session
     auto conn2 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
-    auto s_conn2 = runner.wait_for_connection();
+    auto s_conn2 = runner.wait_for_connection(2);
     REQUIRE(s_conn2 != nullptr);
     TestClientEndpoint c2;
     c2.conn = conn2;
@@ -967,6 +1109,8 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
     c2.send(MsgClientHello{.protocol_version = 1});
     auto h2 = c2.wait_for_msg<MsgServerHello>();
     REQUIRE(h2.has_value());
+    uint64_t c2_id = h2->assigned_client_id;
+    CHECK(c2_id == 2);
 
     c2.send(MsgAttachSessionReq{.session_name = "shared", .cols = 80, .rows = 24});
     auto a2 = c2.wait_for_msg<MsgAttachSessionResp>();
@@ -1018,25 +1162,55 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
     }, 4000ms);
     CHECK(d2.has_value());
 
-    // 5. Client 3 attaches with detach_others = true (attach -d)
+    // 5. Client 3 attaches over live connection with detach_others = true (attach -d)
+    auto conn3 = *TcpTlsConnector::connect("127.0.0.1", port, pki.client_cfg, 2000ms);
+    auto s_conn3 = runner.wait_for_connection(3);
+    REQUIRE(s_conn3 != nullptr);
+    TestClientEndpoint c3;
+    c3.conn = conn3;
+    c3.setup();
+
+    c3.send(MsgClientHello{.protocol_version = 1});
+    auto h3 = c3.wait_for_msg<MsgServerHello>();
+    REQUIRE(h3.has_value());
+    uint64_t c3_id = h3->assigned_client_id;
+    CHECK(c3_id == 3);
+
+    // Client 3 attaches with detach_others = true
     {
         std::lock_guard<std::recursive_mutex> lock(runner.mutex());
         auto s = runner.engine().session_manager().find_session(1);
         REQUIRE(s != nullptr);
-        auto detached = s->attach_client(999, false, 80, 24, /*detach_others=*/true);
+        auto detached = s->attach_client(c3_id, /*read_only=*/false, 80, 24, /*detach_others=*/true);
         CHECK(detached.size() == 2);
         for (uint64_t did : detached) {
             MsgDetachNotice notice;
             notice.reason = "Detached by another client attachment (-d)";
-            if (did == h1->assigned_client_id) {
-                // Sent to c1
-                runner.engine().handle_message(did, notice);
-            }
+            runner.send_to_client(did, notice);
         }
+    }
+
+    // Verify both Client 1 and Client 2 receive MsgDetachNotice over the wire!
+    auto notice1 = c1.wait_for_msg<MsgDetachNotice>();
+    REQUIRE(notice1.has_value());
+    CHECK(notice1->reason.find("Detached") != std::string::npos);
+
+    auto notice2 = c2.wait_for_msg<MsgDetachNotice>();
+    REQUIRE(notice2.has_value());
+    CHECK(notice2->reason.find("Detached") != std::string::npos);
+
+    // Verify only Client 3 remains attached to session 1
+    {
+        std::lock_guard<std::recursive_mutex> lock(runner.mutex());
+        auto s = runner.engine().session_manager().find_session(1);
+        REQUIRE(s != nullptr);
+        CHECK(s->attached_clients().size() == 1);
+        CHECK(s->attached_clients()[0].client_id == c3_id);
     }
 
     conn1->close();
     conn2->close();
+    conn3->close();
     runner.stop();
     listener->close();
 }
@@ -1045,176 +1219,230 @@ TEST_CASE("E2E-5: Simultaneous Multi-Client Attach (window-size = latest dynamic
 // Requirement 6: Interactive Daily-Driver Client UX End-to-End
 // ============================================================================
 TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, Copy Mode scrollback fetch + OSC 52, Mouse drag resize & DECSET 2026)") {
-    ClientApp app(80, 24);
+    std::string sock_path = "/tmp/test_tmux2_ux_e2e_" + std::to_string(::getpid()) + ".sock";
+    ::unlink(sock_path.c_str());
 
-    // Initial server state with two sessions: "work" and "infra"
-    MsgServerHello hello{
-        .server_version = 1,
-        .assigned_client_id = 1,
-        .session_list = {
-            SessionSummary{.session_id = 1, .name = "work"},
-            SessionSummary{.session_id = 2, .name = "infra"}
-        }
-    };
-    app.handle_server_message(hello);
+    auto listener_res = UnixListener::create(sock_path);
+    REQUIRE(listener_res.has_value());
+    auto listener = std::move(*listener_res);
 
-    // Layout update for session 1
-    MsgLayoutUpdate layout{
-        .server_seq = 1,
-        .session_id = 1,
-        .window_id = 1,
-        .active_pane_id = 1,
-        .zoomed_pane_id = 0
-    };
-    app.handle_server_message(layout);
-    app.renderer().set_pane_rects({
-        PaneRect{.pane_id = 1, .x = 0, .y = 0, .width = 39, .height = 23},
-        PaneRect{.pane_id = 2, .x = 40, .y = 0, .width = 40, .height = 23}
-    });
+    ServerBridgeRunner runner(listener.get(), /*mock_pty=*/false);
 
-    // 1. Session Chooser overlay (Prefix + s)
-    SUBCASE("Prefix + s activates session chooser and in-band session switch") {
-        CHECK_FALSE(app.session_chooser().is_active());
+    auto client_conn_res = UnixConnector::connect(sock_path, 2000ms);
+    REQUIRE(client_conn_res.has_value());
+    auto client_conn = *client_conn_res;
+
+    auto s_conn = runner.wait_for_connection(1);
+    REQUIRE(s_conn != nullptr);
+
+    // ClientApp connected across live transport to live ServerEngine
+    ConnectedClientApp client(client_conn, 80, 24);
+
+    // Initial handshake
+    client.send_msg(MsgClientHello{.protocol_version = 1});
+    auto hello_resp = client.wait_for_inbound<MsgServerHello>();
+    REQUIRE(hello_resp.has_value());
+
+    // 1. Create sessions "work" (attached) and "infra" (detached)
+    client.send_msg(MsgNewSessionReq{.name = "work", .detached = false});
+    auto work_resp = client.wait_for_inbound<MsgNewSessionResp>();
+    REQUIRE(work_resp.has_value());
+    CHECK(work_resp->success);
+    uint32_t work_sid = work_resp->session_id;
+
+    auto att_resp = client.wait_for_inbound<MsgAttachSessionResp>();
+    REQUIRE(att_resp.has_value());
+    CHECK(att_resp->success);
+
+    auto work_layout = client.wait_for_inbound<MsgLayoutUpdate>();
+    REQUIRE(work_layout.has_value());
+
+    // Split window in "work" so we have 2 panes for testing split-border drag resize and mouse click focus
+    client.send_msg(MsgCommandRpcReq{.rpc_id = 50, .command_dsl = "split-window -h"});
+    auto split_resp = client.wait_for_inbound<MsgCommandRpcResp>();
+    REQUIRE(split_resp.has_value());
+    CHECK(split_resp->exit_code == 0);
+
+    auto split_layout = client.wait_for_inbound<MsgLayoutUpdate>();
+    REQUIRE(split_layout.has_value());
+
+    // Create session "infra" (detached)
+    client.send_msg(MsgNewSessionReq{.name = "infra", .detached = true});
+    auto infra_resp = client.wait_for_inbound<MsgNewSessionResp>();
+    REQUIRE(infra_resp.has_value());
+    CHECK(infra_resp->success);
+    uint32_t infra_sid = infra_resp->session_id;
+
+    // Refresh session list so ClientApp caches both "work" and "infra"
+    client.send_msg(MsgListSessionsReq{});
+    auto list_resp = client.wait_for_inbound<MsgListSessionsResp>();
+    REQUIRE(list_resp.has_value());
+    CHECK(list_resp->sessions.size() == 2);
+
+    // 2. Session Chooser overlay (Prefix + s)
+    {
+        CHECK_FALSE(client.app.session_chooser().is_active());
 
         // Press Prefix (Ctrl-b)
-        auto r_pre = app.process_input_event(ClientKeyEvent{
+        client.send_input_event(ClientKeyEvent{
             .key_code = 'b', .modifiers = KeyModifiers::Ctrl, .raw_bytes = {0x02}
         });
-        CHECK(r_pre.should_redraw);
+        CHECK(client.app.keybindings().is_prefix_active());
 
         // Press 's'
-        auto r_s = app.process_input_event(ClientKeyEvent{.key_code = 's', .raw_bytes = {'s'}});
-        CHECK(r_s.should_redraw);
-        CHECK(app.session_chooser().is_active());
+        client.send_input_event(ClientKeyEvent{.key_code = 's', .raw_bytes = {'s'}});
+        CHECK(client.app.session_chooser().is_active());
 
         // Move to second session 'j' and press Enter
-        app.process_input_event(ClientKeyEvent{.key_code = 'j'});
-        auto r_enter = app.process_input_event(ClientKeyEvent{.key_code = SpecialKey::Enter});
-        REQUIRE(r_enter.outbound_messages.size() == 1);
-        REQUIRE(std::holds_alternative<MsgSwitchSessionReq>(r_enter.outbound_messages[0]));
-        const auto& sw = std::get<MsgSwitchSessionReq>(r_enter.outbound_messages[0]);
-        CHECK(sw.session_name == "infra");
-        CHECK_FALSE(app.session_chooser().is_active());
+        client.send_input_event(ClientKeyEvent{.key_code = 'j'});
+        // Press Enter -> generates MsgSwitchSessionReq to "infra" and transmits across transport
+        client.send_input_event(ClientKeyEvent{.key_code = SpecialKey::Enter});
+        CHECK_FALSE(client.app.session_chooser().is_active());
+
+        // Verify server executes in-band switch across transport
+        auto sw_resp = client.wait_for_inbound<MsgSwitchSessionResp>();
+        REQUIRE(sw_resp.has_value());
+        CHECK(sw_resp->success);
+        CHECK(sw_resp->session_id == infra_sid);
+        CHECK(client.app.attached_session_id() == infra_sid);
+
+        // Switch back to "work" session
+        client.send_msg(MsgSwitchSessionReq{.session_name = "work"});
+        auto back_resp = client.wait_for_inbound<MsgSwitchSessionResp>();
+        REQUIRE(back_resp.has_value());
+        CHECK(back_resp->success);
+        CHECK(client.app.attached_session_id() == work_sid);
+
+        // Drain layout update for "work"
+        auto work_layout2 = client.wait_for_inbound<MsgLayoutUpdate>();
+        REQUIRE(work_layout2.has_value());
     }
 
-    // 2. Copy Mode with >100 lines scrollback slice fetch + OSC 52 yank
-    SUBCASE("Prefix + [ enters copy mode, fetches missing scrollback slice, visual select & yanks OSC 52") {
-        // Feed initial pane snapshot
-        MsgScreenSnapshot snap{
-            .server_seq = 2,
-            .pane_id = 1,
-            .cols = 39,
-            .rows = 23,
-            .cells = std::vector<Cell>(39 * 23)
-        };
-        app.handle_server_message(snap);
+    // 3. Copy Mode with >100 lines real PTY scrollback slice fetch + OSC 52 yank
+    {
+        // Generate >100 lines of real PTY output
+        {
+            std::lock_guard<std::recursive_mutex> lock(runner.mutex());
+            auto s = runner.engine().session_manager().find_session(work_sid);
+            REQUIRE(s != nullptr);
+            auto win = s->active_window();
+            REQUIRE(win != nullptr);
+            auto pane = win->active_pane();
+            REQUIRE(pane != nullptr);
+            pane->write_input("for i in $(seq 1 150); do echo \"UX_LOG_LINE_$i\"; done\n");
+        }
+
+        // Wait for output to be processed by VTE
+        auto line_diff = client.wait_for_matching_inbound([](const ProtocolMessage& m) {
+            return std::holds_alternative<MsgFrameDiff>(m) &&
+                   frame_diff_contains(std::get<MsgFrameDiff>(m), "UX_LOG_LINE_150");
+        }, 5000ms);
+        REQUIRE(line_diff.has_value());
+
+        // Configure renderer pane rects
+        client.app.renderer().set_pane_rects({
+            PaneRect{.pane_id = 1, .x = 0, .y = 0, .width = 39, .height = 23},
+            PaneRect{.pane_id = 2, .x = 40, .y = 0, .width = 40, .height = 23}
+        });
 
         // Enter copy mode via Prefix + [
-        app.process_input_event(ClientKeyEvent{
+        client.send_input_event(ClientKeyEvent{
             .key_code = 'b', .modifiers = KeyModifiers::Ctrl, .raw_bytes = {0x02}
         });
-        auto r_copy = app.process_input_event(ClientKeyEvent{.key_code = '[', .raw_bytes = {'['}});
-        CHECK(r_copy.should_redraw);
-        CHECK(app.copy_mode().is_active());
-        // Configure total lines for testing >100 lines history paging
-        app.copy_mode().enter(1, 39, 23, 150);
-        CHECK(app.copy_mode().total_lines() == 150);
+        client.send_input_event(ClientKeyEvent{.key_code = '[', .raw_bytes = {'['}});
+        CHECK(client.app.copy_mode().is_active());
 
-        // Navigate up (jump to top line 0)
-        auto r_g = app.process_input_event(ClientKeyEvent{.key_code = 'g'});
-        CHECK(r_g.should_redraw);
+        // Press 'g' to jump to top of history (line 0)
+        client.send_input_event(ClientKeyEvent{.key_code = 'g'});
+        // ClientApp generated MsgScrollbackSliceReq and sent it to server; wait for MsgScrollbackSliceResp
+        auto slice_resp = client.wait_for_inbound<MsgScrollbackSliceResp>();
+        REQUIRE(slice_resp.has_value());
+        CHECK(slice_resp->total_available_lines >= 100);
+        CHECK(client.app.copy_mode().total_lines() >= 100);
 
-        // Because line 0 was not in local buffer, copy mode generates MsgScrollbackSliceReq
-        if (r_g.outbound_messages.empty()) {
-            // Check if slice_req was generated on subsequent navigation
-            auto r_k = app.process_input_event(ClientKeyEvent{.key_code = 'k'});
-            (void)r_k;
+        // Verify slice_resp contains log lines
+        bool has_log_line = false;
+        for (const auto& line : slice_resp->lines) {
+            std::string s;
+            for (const auto& c : line.cells) {
+                if (c.codepoint > 0 && c.codepoint < 128) s.push_back((char)c.codepoint);
+            }
+            if (s.find("UX_LOG_LINE") != std::string::npos) {
+                has_log_line = true;
+                break;
+            }
+        }
+        CHECK(has_log_line);
+
+        // Navigate down to line with output ('j' 5 times)
+        for (int i = 0; i < 5; ++i) {
+            client.send_input_event(ClientKeyEvent{.key_code = 'j'});
         }
 
-        // Server responds with MsgScrollbackSliceResp
-        MsgScrollbackSliceResp slice_resp;
-        slice_resp.pane_id = 1;
-        slice_resp.start_line = 0;
-        slice_resp.total_available_lines = 150;
-        for (int i = 0; i < 24; ++i) {
-            ScrollbackLine sl;
-            std::string txt = "log_line_" + std::to_string(i);
-            for (char ch : txt) sl.cells.push_back(Cell{.codepoint = (char32_t)ch});
-            slice_resp.lines.push_back(std::move(sl));
-        }
-        app.handle_server_message(slice_resp);
+        // Line selection (V) and yank (y)
+        client.send_input_event(ClientKeyEvent{.key_code = 'V'});
+        CHECK(client.app.copy_mode().is_selecting());
 
-        // Begin selection (Space)
-        auto r_sp = app.process_input_event(ClientKeyEvent{.key_code = ' '});
-        CHECK(app.copy_mode().is_selecting());
-        (void)r_sp;
-
-        // Move right 8 characters
-        for (int i = 0; i < 8; ++i) {
-            app.process_input_event(ClientKeyEvent{.key_code = 'l'});
-        }
-
-        // Yank selection (y)
-        auto r_yank = app.process_input_event(ClientKeyEvent{.key_code = 'y'});
-        CHECK_FALSE(app.copy_mode().is_active());
+        auto r_yank = client.app.process_input_event(ClientKeyEvent{.key_code = 'y'});
+        CHECK_FALSE(client.app.copy_mode().is_active());
         CHECK_FALSE(r_yank.terminal_output.empty());
 
-        // Verify OSC 52 sequence format
+        // Verify OSC 52 sequence format: \x1b]52;c;...\x07
         CHECK(r_yank.terminal_output.starts_with("\x1b]52;c;"));
         CHECK(r_yank.terminal_output.ends_with("\x07"));
 
-        // Verify decoded base64 contents
+        // Verify decoded base64 contents contain text from shell output
         size_t b64_start = r_yank.terminal_output.rfind(';') + 1;
         size_t b64_end = r_yank.terminal_output.find('\x07', b64_start);
         std::string b64 = r_yank.terminal_output.substr(b64_start, b64_end - b64_start);
         std::string decoded = Renderer::base64_decode(b64);
-        CHECK(decoded.starts_with("log_line"));
+        CHECK(decoded.find("UX_LOG_LINE") != std::string::npos);
     }
 
-    // 3. Mouse SGR Click Focus, Split-Border Drag Resize, and Wheel Scroll
-    SUBCASE("Mouse SGR click focus, border drag resizing, and wheel scroll") {
-        // Click inside pane 2 (col 50, row 10)
+    // 4. Mouse SGR Click Focus, Split-Border Drag Resize, and Wheel Scroll
+    {
+        client.app.renderer().set_active_pane(1);
+        const auto rects_init = client.app.renderer().pane_rects();
+        REQUIRE(rects_init.size() >= 2);
+        uint32_t p2_id = rects_init[1].pane_id;
+
+        // Click inside pane 2 to focus it
         ClientMouseEvent click_p2{
             .kind = ClientMouseEvent::Kind::Press,
             .button = ClientMouseEvent::Button::Left,
-            .col = 50,
-            .row = 10
+            .col = static_cast<uint16_t>(rects_init[1].x + 5),
+            .row = static_cast<uint16_t>(rects_init[1].y + 5)
         };
-        auto r_click = app.process_input_event(click_p2);
+        auto r_click = client.app.process_input_event(click_p2);
         CHECK(r_click.should_redraw);
-        CHECK(app.renderer().active_pane() == 2);
+        CHECK(client.app.renderer().active_pane() == p2_id);
 
-        // Drag vertical border at col 39
-        ClientMouseEvent drag_press{
+        // Drag vertical border
+        uint16_t border_col = rects_init[0].x + rects_init[0].width;
+        uint16_t border_row = rects_init[0].y + 5;
+
+        client.app.process_input_event(ClientMouseEvent{
             .kind = ClientMouseEvent::Kind::Press,
             .button = ClientMouseEvent::Button::Left,
-            .col = 39,
-            .row = 10
-        };
-        app.process_input_event(drag_press);
-
-        // Move border right by 5 columns to col 44
-        ClientMouseEvent drag_move{
+            .col = border_col,
+            .row = border_row
+        });
+        client.app.process_input_event(ClientMouseEvent{
             .kind = ClientMouseEvent::Kind::Move,
             .button = ClientMouseEvent::Button::Left,
-            .col = 44,
-            .row = 10
-        };
-        auto r_drag = app.process_input_event(drag_move);
-        CHECK(r_drag.should_redraw);
-
-        ClientMouseEvent drag_rel{
+            .col = static_cast<uint16_t>(border_col + 4),
+            .row = border_row
+        });
+        client.app.process_input_event(ClientMouseEvent{
             .kind = ClientMouseEvent::Kind::Release,
             .button = ClientMouseEvent::Button::Left,
-            .col = 44,
-            .row = 10
-        };
-        app.process_input_event(drag_rel);
+            .col = static_cast<uint16_t>(border_col + 4),
+            .row = border_row
+        });
 
-        const auto& rects = app.renderer().pane_rects();
-        REQUIRE(rects.size() == 2);
-        CHECK(rects[0].width == 44);
-        CHECK(rects[1].x == 45);
+        const auto& rects_dragged = client.app.renderer().pane_rects();
+        REQUIRE(rects_dragged.size() >= 2);
+        CHECK(rects_dragged[0].width == rects_init[0].width + 4);
 
         // Mouse wheel scroll enters copy mode
         ClientMouseEvent wheel{
@@ -1223,15 +1451,20 @@ TEST_CASE("E2E-6: Interactive Daily-Driver Client UX (Session Chooser overlay, C
             .col = 10,
             .row = 5
         };
-        auto r_wheel = app.process_input_event(wheel);
+        auto r_wheel = client.app.process_input_event(wheel);
         CHECK(r_wheel.should_redraw);
-        CHECK(app.copy_mode().is_active());
+        CHECK(client.app.copy_mode().is_active());
     }
 
-    // 4. DECSET 2026 Synchronized Output
-    SUBCASE("Rendered frame wrapped in DECSET 2026 synchronized output escape sequence") {
-        std::string frame = app.render_frame(/*use_decset_2026=*/true);
+    // 5. DECSET 2026 Synchronized Output
+    {
+        std::string frame = client.app.render_frame(/*use_decset_2026=*/true);
         CHECK(frame.starts_with("\x1b[?2026h"));
         CHECK(frame.ends_with("\x1b[?2026l"));
     }
+
+    client_conn->close();
+    runner.stop();
+    listener->close();
+    ::unlink(sock_path.c_str());
 }

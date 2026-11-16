@@ -123,6 +123,10 @@ void TcpStream::set_on_frame(FrameCallback cb) {
 
 void TcpStream::set_on_data(DataCallback cb) {
     m_on_data = std::move(cb);
+    if (m_on_data && !m_read_buffer.empty()) {
+        m_on_data(m_read_buffer);
+        m_read_buffer.clear();
+    }
 }
 
 void TcpStream::deliver_frame(const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
@@ -134,16 +138,17 @@ void TcpStream::deliver_frame(const protocol::StreamHeader& hdr, std::span<const
         m_on_frame(hdr, payload);
     } else if (m_on_data) {
         m_on_data(payload);
+    } else {
+        m_read_buffer.insert(m_read_buffer.end(), payload.begin(), payload.end());
     }
-
-    m_read_buffer.insert(m_read_buffer.end(), payload.begin(), payload.end());
 }
 
 void TcpStream::deliver_data(std::span<const std::byte> data) {
     if (m_on_data) {
         m_on_data(data);
+    } else {
+        m_read_buffer.insert(m_read_buffer.end(), data.begin(), data.end());
     }
-    m_read_buffer.insert(m_read_buffer.end(), data.begin(), data.end());
 }
 
 // --- TcpTlsConnection ---
@@ -239,9 +244,14 @@ void TcpTlsConnection::register_with_reactor(reactor::Reactor& reactor) {
     m_reactor = &reactor;
     if (m_fd < 0) return;
 
+    reactor::EventFlags flags = reactor::EventFlags::Readable;
+    if (!m_out_buffer.empty()) {
+        flags |= reactor::EventFlags::Writable;
+    }
+
     (void)m_reactor->register_fd(
         m_fd,
-        reactor::EventFlags::Readable | reactor::EventFlags::Writable,
+        flags,
         [this](int, reactor::EventFlags) {
             poll_io();
         }
@@ -293,6 +303,10 @@ std::expected<void, std::error_code> TcpTlsConnection::queue_frame(
     auto hdr_bytes = protocol::encode_header(hdr);
     m_out_buffer.insert(m_out_buffer.end(), hdr_bytes.begin(), hdr_bytes.end());
     m_out_buffer.insert(m_out_buffer.end(), payload.begin(), payload.end());
+
+    if (m_reactor && m_fd >= 0) {
+        (void)m_reactor->modify_fd(m_fd, reactor::EventFlags::Readable | reactor::EventFlags::Writable);
+    }
     return {};
 }
 
@@ -311,6 +325,14 @@ void TcpTlsConnection::flush_outbound() {
             break;
         }
         m_out_buffer.erase(m_out_buffer.begin(), m_out_buffer.begin() + written);
+    }
+
+    if (m_reactor && m_fd >= 0) {
+        reactor::EventFlags flags = reactor::EventFlags::Readable;
+        if (!m_out_buffer.empty()) {
+            flags |= reactor::EventFlags::Writable;
+        }
+        (void)m_reactor->modify_fd(m_fd, flags);
     }
 }
 
@@ -534,7 +556,8 @@ std::expected<std::shared_ptr<TcpTlsConnection>, std::string> TcpTlsConnector::c
     uint16_t port,
     const TlsConfig& config,
     std::chrono::milliseconds timeout,
-    reactor::Reactor* reactor
+    reactor::Reactor* reactor,
+    std::atomic<bool>* cancel
 ) {
     auto ctx_res = create_tls_client_ctx(config);
     if (!ctx_res) return std::unexpected(ctx_res.error());
@@ -573,6 +596,10 @@ std::expected<std::shared_ptr<TcpTlsConnection>, std::string> TcpTlsConnector::c
     auto start_time = std::chrono::steady_clock::now();
     bool socket_connected = false;
     while (std::chrono::steady_clock::now() - start_time < timeout) {
+        if (cancel && cancel->load()) {
+            ::close(fd);
+            return std::unexpected("TCP connection cancelled");
+        }
         fd_set wfds;
         FD_ZERO(&wfds);
         FD_SET(fd, &wfds);
@@ -617,6 +644,10 @@ std::expected<std::shared_ptr<TcpTlsConnection>, std::string> TcpTlsConnector::c
 
     // Drive TLS handshake
     while (std::chrono::steady_clock::now() - start_time < timeout) {
+        if (cancel && cancel->load()) {
+            conn->close();
+            return std::unexpected("TCP connection cancelled");
+        }
         if (conn->do_handshake()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -632,6 +663,10 @@ std::expected<std::shared_ptr<TcpTlsConnection>, std::string> TcpTlsConnector::c
     // immediate rejection alert or socket closure.
     auto verify_start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - verify_start < std::chrono::milliseconds(30)) {
+        if (cancel && cancel->load()) {
+            conn->close();
+            return std::unexpected("TCP connection cancelled");
+        }
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);

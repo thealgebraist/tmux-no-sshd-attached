@@ -7,6 +7,7 @@
 #include <memory>
 #include <unordered_map>
 #include <chrono>
+#include <atomic>
 
 namespace tmux2::transport {
 
@@ -36,6 +37,7 @@ public:
 
     // Internal poll to read available bytes and dispatch callbacks
     void poll_stream();
+    void flush_outbound();
 
 private:
     SSL* m_ssl{nullptr};
@@ -46,6 +48,7 @@ private:
     FrameCallback m_on_frame;
     DataCallback m_on_data;
     std::vector<std::byte> m_in_buffer;
+    std::vector<std::byte> m_out_buffer;
 };
 
 class QuicConnection : public IConnection, public std::enable_shared_from_this<QuicConnection> {
@@ -139,16 +142,19 @@ private:
         std::shared_ptr<UniqueSslCtx> ctx,
         UniqueSsl listener,
         int fd,
-        uint16_t port
+        uint16_t port,
+        TlsConfig config
     );
 
     std::shared_ptr<UniqueSslCtx> m_ctx;
     UniqueSsl m_listener;
     int m_fd{-1};
     uint16_t m_port{0};
+    TlsConfig m_config;
     bool m_closed{false};
 
     reactor::Reactor* m_reactor{nullptr};
+    reactor::TimerId m_timer_id{reactor::kInvalidTimerId};
     AcceptCallback m_on_accept;
 };
 
@@ -159,7 +165,8 @@ public:
         uint16_t port,
         const TlsConfig& config,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
-        reactor::Reactor* reactor = nullptr
+        reactor::Reactor* reactor = nullptr,
+        std::atomic<bool>* cancel = nullptr
     );
 };
 

@@ -157,6 +157,11 @@ std::expected<UniqueSslCtx, std::string> create_quic_server_ctx(const TlsConfig&
     UniqueSslCtx ctx(SSL_CTX_new(method));
     if (!ctx) return std::unexpected("Failed to allocate QUIC server context");
 
+    const char* ciphers = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256";
+    SSL_CTX_set_ciphersuites(ctx.get(), ciphers);
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
+
     if (!load_certificates(ctx.get(), config)) {
         return std::unexpected("Failed to load certificates or private key into QUIC server context");
     }
@@ -181,6 +186,11 @@ std::expected<UniqueSslCtx, std::string> create_quic_client_ctx(const TlsConfig&
     const SSL_METHOD* method = OSSL_QUIC_client_method();
     UniqueSslCtx ctx(SSL_CTX_new(method));
     if (!ctx) return std::unexpected("Failed to allocate QUIC client context");
+
+    const char* ciphers = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256";
+    SSL_CTX_set_ciphersuites(ctx.get(), ciphers);
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
 
     if (!load_certificates(ctx.get(), config)) {
         return std::unexpected("Failed to load certificates or private key into QUIC client context");

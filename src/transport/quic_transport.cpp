@@ -33,8 +33,26 @@ bool QuicStream::is_closed() const noexcept {
     return m_closed || !m_ssl;
 }
 
+void QuicStream::flush_outbound() {
+    if (is_closed() || m_out_buffer.empty() || !m_ssl) return;
+    while (!m_out_buffer.empty()) {
+        size_t written = 0;
+        int ret = SSL_write_ex(m_ssl, m_out_buffer.data(), m_out_buffer.size(), &written);
+        if (ret <= 0) {
+            int err = SSL_get_error(m_ssl, ret);
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                break;
+            }
+            m_closed = true;
+            break;
+        }
+        m_out_buffer.erase(m_out_buffer.begin(), m_out_buffer.begin() + written);
+    }
+}
+
 void QuicStream::close() {
     if (!m_closed && m_ssl) {
+        flush_outbound();
         m_closed = true;
         SSL_stream_conclude(m_ssl, 0);
         SSL_free(m_ssl);
@@ -47,22 +65,28 @@ std::expected<size_t, std::error_code> QuicStream::write(std::span<const std::by
         return std::unexpected(std::make_error_code(std::errc::not_connected));
     }
 
-    size_t total_written = 0;
-    while (total_written < data.size()) {
-        size_t written = 0;
-        int ret = SSL_write_ex(m_ssl, data.data() + total_written, data.size() - total_written, &written);
-        if (ret <= 0) {
-            int err = SSL_get_error(m_ssl, ret);
-            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                if (total_written > 0) return total_written;
-                return std::unexpected(std::make_error_code(std::errc::resource_unavailable_try_again));
-            }
-            return std::unexpected(std::make_error_code(std::errc::io_error));
-        }
-        total_written += written;
+    flush_outbound();
+    if (!m_out_buffer.empty()) {
+        m_out_buffer.insert(m_out_buffer.end(), data.begin(), data.end());
+        return data.size();
     }
 
-    return total_written;
+    size_t written = 0;
+    int ret = SSL_write_ex(m_ssl, data.data(), data.size(), &written);
+    if (ret <= 0) {
+        int err = SSL_get_error(m_ssl, ret);
+        if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+            m_out_buffer.insert(m_out_buffer.end(), data.begin(), data.end());
+            return data.size();
+        }
+        return std::unexpected(std::make_error_code(std::errc::io_error));
+    }
+
+    if (written < data.size()) {
+        m_out_buffer.insert(m_out_buffer.end(), data.begin() + written, data.end());
+    }
+
+    return data.size();
 }
 
 std::expected<size_t, std::error_code> QuicStream::read(std::span<std::byte> out) {
@@ -77,7 +101,7 @@ std::expected<size_t, std::error_code> QuicStream::read(std::span<std::byte> out
     }
 
     if (is_closed()) {
-        return std::unexpected(std::make_error_code(std::errc::not_connected));
+        return 0; // EOF
     }
 
     size_t bytes_read = 0;
@@ -130,6 +154,8 @@ void QuicStream::set_on_data(DataCallback cb) {
 
 void QuicStream::poll_stream() {
     if (is_closed()) return;
+
+    flush_outbound();
 
     std::byte temp[4096];
     while (true) {
@@ -191,7 +217,14 @@ QuicConnection::~QuicConnection() {
 }
 
 bool QuicConnection::is_connected() const noexcept {
-    return !m_closed && m_ssl && SSL_is_connection(m_ssl.get()) && SSL_is_init_finished(m_ssl.get());
+    if (m_closed || !m_ssl || !SSL_is_connection(m_ssl.get()) || !SSL_is_init_finished(m_ssl.get())) {
+        return false;
+    }
+    SSL_CONN_CLOSE_INFO ccinfo{};
+    if (SSL_get_conn_close_info(m_ssl.get(), &ccinfo, sizeof(ccinfo)) == 1) {
+        return false;
+    }
+    return true;
 }
 
 void QuicConnection::close() {
@@ -265,7 +298,12 @@ void QuicConnection::register_with_reactor(reactor::Reactor& reactor) {
     m_reactor = &reactor;
     if (m_fd < 0 || !m_ssl) return;
 
-    auto res = m_reactor->register_fd(m_fd, reactor::EventFlags::Readable | reactor::EventFlags::Writable,
+    reactor::EventFlags flags = reactor::EventFlags::Readable;
+    if (SSL_net_write_desired(m_ssl.get())) {
+        flags |= reactor::EventFlags::Writable;
+    }
+
+    auto res = m_reactor->register_fd(m_fd, flags,
         [this](int, reactor::EventFlags) {
             poll_io();
         });
@@ -319,7 +357,12 @@ void QuicConnection::poll_io() {
         }
     }
 
-    if (m_reactor) {
+    if (m_reactor && m_fd >= 0) {
+        reactor::EventFlags flags = reactor::EventFlags::Readable;
+        if (SSL_net_write_desired(m_ssl.get())) {
+            flags |= reactor::EventFlags::Writable;
+        }
+        (void)m_reactor->modify_fd(m_fd, flags);
         m_reactor->sync_openssl_timeout(m_ssl.get(), m_timer_id);
     }
 }
@@ -330,12 +373,14 @@ QuicListener::QuicListener(
     std::shared_ptr<UniqueSslCtx> ctx,
     UniqueSsl listener,
     int fd,
-    uint16_t port
+    uint16_t port,
+    TlsConfig config
 )
     : m_ctx(std::move(ctx)),
       m_listener(std::move(listener)),
       m_fd(fd),
-      m_port(port) {}
+      m_port(port),
+      m_config(std::move(config)) {}
 
 QuicListener::~QuicListener() {
     close();
@@ -401,7 +446,7 @@ std::expected<std::unique_ptr<QuicListener>, std::string> QuicListener::create(
         return std::unexpected("Failed to start QUIC listener");
     }
 
-    return std::unique_ptr<QuicListener>(new QuicListener(ctx, std::move(listener), fd, port));
+    return std::unique_ptr<QuicListener>(new QuicListener(ctx, std::move(listener), fd, port, config));
 }
 
 std::expected<std::shared_ptr<IConnection>, std::error_code> QuicListener::accept_connection() {
@@ -448,10 +493,19 @@ void QuicListener::register_with_reactor(reactor::Reactor& reactor) {
         [this](int, reactor::EventFlags) {
             auto res = accept_connection();
             (void)res;
+            if (m_reactor && m_listener) {
+                m_reactor->sync_openssl_timeout(m_listener.get(), m_timer_id);
+            }
         });
+
+    m_reactor->sync_openssl_timeout(m_listener.get(), m_timer_id);
 }
 
 void QuicListener::unregister_from_reactor(reactor::Reactor& reactor) {
+    if (m_timer_id != reactor::kInvalidTimerId) {
+        reactor.timer_heap().cancel(m_timer_id);
+        m_timer_id = reactor::kInvalidTimerId;
+    }
     if (m_fd >= 0) {
         (void)reactor.unregister_fd(m_fd);
     }
@@ -480,7 +534,8 @@ std::expected<std::shared_ptr<QuicConnection>, std::string> QuicConnector::conne
     uint16_t port,
     const TlsConfig& config,
     std::chrono::milliseconds timeout,
-    reactor::Reactor* reactor
+    reactor::Reactor* reactor,
+    std::atomic<bool>* cancel
 ) {
     auto ctx_res = create_quic_client_ctx(config);
     if (!ctx_res) return std::unexpected(ctx_res.error());
@@ -539,6 +594,11 @@ std::expected<std::shared_ptr<QuicConnection>, std::string> QuicConnector::conne
     bool connected = false;
 
     while (std::chrono::steady_clock::now() - start_time < timeout) {
+        if (cancel && cancel->load()) {
+            ::close(fd);
+            return std::unexpected("QUIC connection cancelled");
+        }
+
         int ret = SSL_connect(ssl.get());
         if (ret == 1) {
             connected = true;
@@ -558,6 +618,23 @@ std::expected<std::shared_ptr<QuicConnection>, std::string> QuicConnector::conne
     if (!connected) {
         ::close(fd);
         return std::unexpected("QUIC connection timed out");
+    }
+
+    // Check if server rejected client certificate with an immediate CONNECTION_CLOSE / alert
+    auto verify_start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - verify_start < std::chrono::milliseconds(30)) {
+        if (cancel && cancel->load()) {
+            ::close(fd);
+            return std::unexpected("QUIC connection cancelled");
+        }
+        SSL_handle_events(ssl.get());
+        SSL_CONN_CLOSE_INFO ccinfo{};
+        if (SSL_get_conn_close_info(ssl.get(), &ccinfo, sizeof(ccinfo)) == 1) {
+            ::close(fd);
+            return std::unexpected("QUIC connection closed by peer: " +
+                std::string(ccinfo.reason ? ccinfo.reason : "alert code " + std::to_string(ccinfo.error_code)));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     // Verify peer certificate hostname if required

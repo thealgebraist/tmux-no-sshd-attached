@@ -539,6 +539,98 @@ TEST_CASE("Strict mTLS Handshake Rejection: ALPN mismatch") {
     listener->close();
 }
 
+TEST_CASE("QUIC Strict mTLS Rejection: Missing client certificate") {
+    auto pki = TestPki::create("127.0.0.1", "alice");
+
+    auto listener = *QuicListener::create("127.0.0.1", 0, pki.server_cfg);
+    uint16_t port = listener->bound_port();
+
+    ServerRunner runner(listener.get());
+
+    TlsConfig bad_client_cfg = pki.client_cfg;
+    bad_client_cfg.cert_pem.clear();
+    bad_client_cfg.key_pem.clear();
+
+    auto conn_res = QuicConnector::connect("127.0.0.1", port, bad_client_cfg, 1000ms);
+    CHECK_FALSE(conn_res.has_value());
+
+    runner.stop();
+    listener->close();
+}
+
+TEST_CASE("QUIC Strict mTLS Rejection: Untrusted / Wrong CA") {
+    auto pki1 = TestPki::create("127.0.0.1", "alice");
+    auto pki2 = TestPki::create("127.0.0.1", "mallory");
+
+    auto listener = *QuicListener::create("127.0.0.1", 0, pki1.server_cfg);
+    uint16_t port = listener->bound_port();
+
+    ServerRunner runner(listener.get());
+
+    TlsConfig attacker_cfg = pki2.client_cfg;
+    attacker_cfg.ca_cert_pem = pki1.ca.certificate_pem;
+
+    auto conn_res = QuicConnector::connect("127.0.0.1", port, attacker_cfg, 1000ms);
+    CHECK_FALSE(conn_res.has_value());
+
+    runner.stop();
+    listener->close();
+}
+
+TEST_CASE("QUIC Strict mTLS Rejection: Untrusted Server Certificate") {
+    auto pki1 = TestPki::create("127.0.0.1", "alice");
+    auto pki2 = TestPki::create("127.0.0.1", "rogue_server");
+
+    auto listener = *QuicListener::create("127.0.0.1", 0, pki2.server_cfg);
+    uint16_t port = listener->bound_port();
+
+    ServerRunner runner(listener.get());
+
+    TlsConfig strict_client_cfg = pki1.client_cfg;
+
+    auto conn_res = QuicConnector::connect("127.0.0.1", port, strict_client_cfg, 1000ms);
+    CHECK_FALSE(conn_res.has_value());
+
+    runner.stop();
+    listener->close();
+}
+
+TEST_CASE("QUIC Strict mTLS Rejection: Hostname mismatch") {
+    auto pki = TestPki::create("dev.tmux2.internal", "alice");
+
+    auto listener = *QuicListener::create("127.0.0.1", 0, pki.server_cfg);
+    uint16_t port = listener->bound_port();
+
+    ServerRunner runner(listener.get());
+
+    TlsConfig mismatch_client_cfg = pki.client_cfg;
+    mismatch_client_cfg.expected_server_name = "prod.tmux2.internal";
+
+    auto conn_res = QuicConnector::connect("127.0.0.1", port, mismatch_client_cfg, 1000ms);
+    CHECK_FALSE(conn_res.has_value());
+
+    runner.stop();
+    listener->close();
+}
+
+TEST_CASE("QUIC Strict mTLS Rejection: ALPN mismatch") {
+    auto pki = TestPki::create("127.0.0.1", "alice");
+
+    auto listener = *QuicListener::create("127.0.0.1", 0, pki.server_cfg);
+    uint16_t port = listener->bound_port();
+
+    ServerRunner runner(listener.get());
+
+    TlsConfig bad_alpn_cfg = pki.client_cfg;
+    bad_alpn_cfg.alpn = "http/1.1";
+
+    auto conn_res = QuicConnector::connect("127.0.0.1", port, bad_alpn_cfg, 1000ms);
+    CHECK_FALSE(conn_res.has_value());
+
+    runner.stop();
+    listener->close();
+}
+
 TEST_CASE("AF_UNIX Domain Socket: 0600 permissions, peer UID, and FrameHeader multiplexing") {
     std::string sock_path = "/tmp/test_tmux2_unix_" + std::to_string(::getpid()) + ".sock";
 
@@ -701,6 +793,42 @@ TEST_CASE("Happy Eyeballs Connector: TCP TLS 1.3 fallback when UDP/QUIC is unrea
     conn->close();
     server_conn->close();
     tcp_listener->close();
+}
+
+TEST_CASE("Happy Eyeballs Connector: Concurrent race when QUIC exceeds fallback delay but wins") {
+    auto pki = TestPki::create("127.0.0.1", "alice");
+
+    // Start QUIC listener
+    auto quic_listener = *QuicListener::create("127.0.0.1", 0, pki.server_cfg);
+    uint16_t quic_port = quic_listener->bound_port();
+
+    ServerRunner quic_runner(quic_listener.get());
+
+    // TCP port is closed/unreachable so TCP fallback fails or stalls
+    uint16_t unreachable_tcp_port = 59998;
+
+    // Set fallback_delay very short (2ms) so fallback TCP thread is guaranteed to start
+    // while QUIC is still handshaking. In the old sequential code, QUIC would timeout at 2ms
+    // and fail completely. In concurrent Happy Eyeballs, QUIC keeps racing and succeeds!
+    HappyEyeballsOptions opts;
+    opts.fallback_delay = 2ms;
+    opts.total_timeout = 3000ms;
+
+    auto conn_res = HappyEyeballsConnector::connect(
+        "127.0.0.1",
+        quic_port,
+        unreachable_tcp_port,
+        pki.client_cfg,
+        opts
+    );
+    REQUIRE(conn_res.has_value());
+    auto conn = *conn_res;
+    CHECK(conn->is_connected());
+    CHECK(conn->type() == TransportType::Quic);
+
+    conn->close();
+    quic_runner.stop();
+    quic_listener->close();
 }
 
 TEST_CASE("Transport Frame Fragmentation & Reassembly") {

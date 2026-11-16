@@ -121,6 +121,10 @@ void UnixStream::set_on_frame(FrameCallback cb) {
 
 void UnixStream::set_on_data(DataCallback cb) {
     m_on_data = std::move(cb);
+    if (m_on_data && !m_read_buffer.empty()) {
+        m_on_data(m_read_buffer);
+        m_read_buffer.clear();
+    }
 }
 
 void UnixStream::deliver_frame(const protocol::StreamHeader& hdr, std::span<const std::byte> payload) {
@@ -132,16 +136,17 @@ void UnixStream::deliver_frame(const protocol::StreamHeader& hdr, std::span<cons
         m_on_frame(hdr, payload);
     } else if (m_on_data) {
         m_on_data(payload);
+    } else {
+        m_read_buffer.insert(m_read_buffer.end(), payload.begin(), payload.end());
     }
-
-    m_read_buffer.insert(m_read_buffer.end(), payload.begin(), payload.end());
 }
 
 void UnixStream::deliver_data(std::span<const std::byte> data) {
     if (m_on_data) {
         m_on_data(data);
+    } else {
+        m_read_buffer.insert(m_read_buffer.end(), data.begin(), data.end());
     }
-    m_read_buffer.insert(m_read_buffer.end(), data.begin(), data.end());
 }
 
 // --- UnixConnection ---
@@ -225,9 +230,14 @@ void UnixConnection::register_with_reactor(reactor::Reactor& reactor) {
     m_reactor = &reactor;
     if (m_fd < 0) return;
 
+    reactor::EventFlags flags = reactor::EventFlags::Readable;
+    if (!m_out_buffer.empty()) {
+        flags |= reactor::EventFlags::Writable;
+    }
+
     (void)m_reactor->register_fd(
         m_fd,
-        reactor::EventFlags::Readable | reactor::EventFlags::Writable,
+        flags,
         [this](int, reactor::EventFlags) {
             poll_io();
         }
@@ -261,6 +271,10 @@ std::expected<void, std::error_code> UnixConnection::queue_frame(
     auto hdr_bytes = protocol::encode_header(hdr);
     m_out_buffer.insert(m_out_buffer.end(), hdr_bytes.begin(), hdr_bytes.end());
     m_out_buffer.insert(m_out_buffer.end(), payload.begin(), payload.end());
+
+    if (m_reactor && m_fd >= 0) {
+        (void)m_reactor->modify_fd(m_fd, reactor::EventFlags::Readable | reactor::EventFlags::Writable);
+    }
     return {};
 }
 
@@ -277,6 +291,14 @@ void UnixConnection::flush_outbound() {
             break;
         }
         m_out_buffer.erase(m_out_buffer.begin(), m_out_buffer.begin() + n);
+    }
+
+    if (m_reactor && m_fd >= 0) {
+        reactor::EventFlags flags = reactor::EventFlags::Readable;
+        if (!m_out_buffer.empty()) {
+            flags |= reactor::EventFlags::Writable;
+        }
+        (void)m_reactor->modify_fd(m_fd, flags);
     }
 }
 

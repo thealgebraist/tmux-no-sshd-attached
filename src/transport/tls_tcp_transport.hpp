@@ -8,6 +8,7 @@
 #include <vector>
 #include <deque>
 #include <chrono>
+#include <atomic>
 
 namespace tmux2::transport {
 
@@ -173,7 +174,8 @@ public:
         uint16_t port,
         const TlsConfig& config,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
-        reactor::Reactor* reactor = nullptr
+        reactor::Reactor* reactor = nullptr,
+        std::atomic<bool>* cancel = nullptr
     );
 };
 

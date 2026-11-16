@@ -1,0 +1,217 @@
+% =============================================================================
+% tmux2.ott — Formal Operational Semantics of tmux2 (mTLS Terminal Multiplexer)
+% Stratified Big-Step Natural Semantics + Small-Step Labelled Transition System
+% =============================================================================
+
+metavar client_id, cid ::= {{ com Client identifier ($u64$) }}
+metavar session_id, sid ::= {{ com Session identifier ($u32$) }}
+metavar window_id, wid ::= {{ com Window identifier ($u32$) }}
+metavar pane_id, pid ::= {{ com Pane identifier ($u32$) }}
+metavar seq_no, seq ::= {{ com Monotonic sequence number ($u64$) }}
+metavar dim, w, h, x, y ::= {{ com Terminal coordinate or dimension ($u16$) }}
+metavar fp, tok, uname, sname ::= {{ com Cryptographic fingerprint, token, or name }}
+metavar bytes, data ::= {{ com Raw byte sequence }}
+
+grammar
+
+% -----------------------------------------------------------------------------
+% 1. Cryptographic & mTLS PKI Primitives (src/pki/, src/transport/)
+% -----------------------------------------------------------------------------
+key_alg :: 'KeyAlg_' ::= {{ com Asymmetric key algorithm }}
+  | Ed25519    ::   :: Ed25519    {{ com RFC 8032 Ed25519 (Primary) }}
+  | P256       ::   :: P256       {{ com NIST P-256 ECDSA }}
+  | WeakRSA    ::   :: WeakRSA    {{ com Rejected RSA < 3072 bits }}
+
+alpn_proto :: 'ALPN_' ::= {{ com TLS 1.3 ALPN protocol identifier }}
+  | Tmux2V1    ::   :: Tmux2V1    {{ com "tmux2/1" mTLS multiplex protocol }}
+  | EnrollV1   ::   :: EnrollV1   {{ com "tmux2-enroll/1" bootstrap protocol }}
+
+cert :: 'Cert_' ::= {{ com X.509v3 Certificate }}
+  | Cert ( key_alg , fp , uname , fp' ) :: :: Mk {{ com Alg, CertFP, SAN-User, IssuerSPKI }}
+
+transport_kind :: 'Trans_' ::= {{ com Underlying transport channel }}
+  | QUIC       ::   :: QUIC       {{ com OpenSSL 3.5 QUIC over UDP/8443 }}
+  | TcpTls     ::   :: TcpTls     {{ com TLS 1.3 over TCP/8443 (Happy Eyeballs fallback) }}
+  | AfUnix     ::   :: AfUnix     {{ com Local 0600 AF_UNIX domain socket }}
+
+auth_decision :: 'Auth_' ::= {{ com Certificate verification & RBAC decision }}
+  | Granted ( uname , fp ) :: :: Granted {{ com Authenticated user & cert fingerprint }}
+  | Denied                 :: :: Denied  {{ com Handshake or identity rejected }}
+
+% -----------------------------------------------------------------------------
+% 2. Spatial Layout Tree & VTE Screen State (src/server/layout.*, src/vte/)
+% -----------------------------------------------------------------------------
+rect :: 'Rect_' ::= {{ com Bounding rectangle $(x, y, w, h)$ }}
+  | Rect ( x , y , w , h ) :: :: Mk
+
+layout_tree, L :: 'Layout_' ::= {{ com Binary split layout tree }}
+  | Leaf ( pid )                        :: :: Leaf   {{ com Single pane leaf }}
+  | HSplit ( w1 , w2 , L1 , L2 )        :: :: HSplit {{ com Left/Right split ($w_1 + 1 + w_2 = w$) }}
+  | VSplit ( h1 , h2 , L1 , L2 )        :: :: VSplit {{ com Top/Bottom split ($h_1 + 1 + h_2 = h$) }}
+  | Zoomed ( pid , L )                  :: :: Zoomed {{ com Active pane zoomed over tree $L$ }}
+
+grid, G :: 'Grid_' ::= {{ com 2D VTE cell matrix }}
+  | EmptyGrid ( w , h )                 :: :: Empty
+  | ApplyRowDiff ( G , pid , bytes )    :: :: ApplyDiff
+  | FeedPty ( G , bytes )               :: :: FeedPty
+
+% -----------------------------------------------------------------------------
+% 3. Wire Protocol Messages (src/protocol/messages.hpp)
+% -----------------------------------------------------------------------------
+msg, m :: 'Msg_' ::= {{ com Framed little-endian wire message }}
+  | ClientHello ( seq , tok )                      :: :: ClientHello
+  | ServerHello ( cid , seq , tok )                :: :: ServerHello
+  | NewSessionReq ( sname , w , h , bool_flag )    :: :: NewSessionReq
+  | AttachSessionReq ( sid , bool_flag , bool_flag' ) :: :: AttachSessionReq {{ com sid, read\_only, detach\_others }}
+  | SwitchSessionReq ( sid )                       :: :: SwitchSessionReq
+  | KeyEvent ( seq , pid , bytes )                 :: :: KeyEvent
+  | ClientResize ( w , h )                         :: :: ClientResize
+  | LayoutUpdate ( sid , wid , L , pid )           :: :: LayoutUpdate
+  | ScreenSnapshot ( seq , pid , G )               :: :: ScreenSnapshot
+  | FrameDiff ( seq , seq' , pid , bytes )         :: :: FrameDiff {{ com srv\_seq, acked\_cli\_seq, pane, diff }}
+  | ScrollbackSliceReq ( pid , seq )               :: :: ScrollbackSliceReq
+  | ScrollbackSliceResp ( pid , bytes )            :: :: ScrollbackSliceResp
+  | DetachNotice                                   :: :: DetachNotice
+
+bool_flag :: 'Bool_' ::=
+  | True  :: :: True
+  | False :: :: False
+
+% -----------------------------------------------------------------------------
+% 4. Command DSL AST (src/server/command_dsl.hpp)
+% -----------------------------------------------------------------------------
+dsl_cmd :: 'DSL_' ::= {{ com Server Command DSL }}
+  | NewSession ( sname , w , h )                   :: :: NewSession
+  | SplitHorizontal ( pid )                        :: :: SplitH
+  | SplitVertical ( pid )                          :: :: SplitV
+  | Attach ( sid , bool_flag , bool_flag' )        :: :: Attach {{ com sid, read\_only, detach\_others }}
+  | KillSession ( sid )                            :: :: KillSession
+
+% -----------------------------------------------------------------------------
+% 5. Client Modal TUI State & Server State (src/client/, src/server/)
+% -----------------------------------------------------------------------------
+ui_mode :: 'UI_' ::= {{ com Client interactive TUI mode }}
+  | Normal         :: :: Normal         {{ com Direct PTY keystroke forwarding }}
+  | PrefixPending  :: :: PrefixPending  {{ com Ctrl-b pressed, awaiting command key }}
+  | SessionChooser :: :: SessionChooser {{ com Interactive session switcher overlay (Ctrl-b s) }}
+  | CopyMode       :: :: CopyMode       {{ com Vi scrollback copy/search/OSC52 mode (Ctrl-b [) }}
+  | Reconnecting   :: :: Reconnecting   {{ com Connection dropped; holding TUI & buffering keys }}
+
+ui_key :: 'Key_' ::= {{ com Local terminal keystroke }}
+  | CtrlB          :: :: CtrlB
+  | CharS          :: :: CharS
+  | CharLBracket   :: :: CharLBracket
+  | CharD          :: :: CharD
+  | CharY          :: :: CharY
+  | Enter          :: :: Enter
+  | Escape         :: :: Escape
+  | Literal ( bytes ) :: :: Literal
+
+client_state, C :: 'Cli_' ::= {{ com Client state tuple }}
+  | CliState ( cid , ui_mode , seq , seq' , tok , G ) :: :: Mk {{ com cid, mode, cli\_seq, last\_srv\_seq, tok, grid }}
+
+server_state, S :: 'Srv_' ::= {{ com Server engine state }}
+  | SrvState ( seq , seq' , G , L ) :: :: Mk {{ com srv\_seq, min\_ring\_seq, active\_grid, layout }}
+
+sys_config, Sys :: 'Sys_' ::= {{ com Global distributed system configuration }}
+  | SysConfig ( S , C ) :: :: Mk
+
+label, alpha :: 'Lbl_' ::= {{ com Small-step LTS transition label }}
+  | LblConnect ( transport_kind , cid )  :: :: Connect
+  | LblKey ( cid , seq )                 :: :: Key
+  | LblPtyOut ( pid )                    :: :: PtyOut
+  | LblDisconnect ( cid )                :: :: Disconnect
+  | LblReconnectDelta ( cid , seq )      :: :: ReconnectDelta
+  | LblReconnectSnap ( cid , seq )       :: :: ReconnectSnap
+  | LblAttachDetachOthers ( cid , sid )  :: :: AttachDetachOthers
+  | LblResizeLatest ( cid , w , h )      :: :: ResizeLatest
+
+defns
+JBigStep :: '' ::=
+
+defn
+fp_ca |- cert : auth_decision :: :: AuthCert :: 'Auth_'
+{{ com Big-Step mTLS 1.3 Certificate & Identity Verification ($\Downarrow_{\text{auth}}$) }}
+by
+
+  --------------------------------------------------------------------------- :: Ed25519_Valid
+  fp_ca |- Cert(Ed25519, fp, uname, fp_ca) : Granted(uname, fp)
+
+  --------------------------------------------------------------------------- :: P256_Valid
+  fp_ca |- Cert(P256, fp, uname, fp_ca) : Granted(uname, fp)
+
+  --------------------------------------------------------------------------- :: WeakKey_Reject
+  fp_ca |- Cert(WeakRSA, fp, uname, fp_ca) : Denied
+
+defn
+L @ rect ==> rect' :: :: EvalLayout :: 'Layout_'
+{{ com Big-Step Spatial Layout Tree Evaluation ($\Downarrow_{\text{layout}}$) }}
+by
+
+  --------------------------------------------------------------------------- :: Leaf
+  Leaf(pid) @ Rect(x, y, w, h) ==> Rect(x, y, w, h)
+
+  L @ Rect(x, y, w, h) ==> Rect(x', y', w', h')
+  --------------------------------------------------------------------------- :: Zoomed_Override
+  Zoomed(pid, L) @ Rect(x, y, w, h) ==> Rect(x, y, w, h)
+
+defn
+ui_mode , ui_key ==> ui_mode' :: :: EvalUiMode :: 'UI_'
+{{ com Big-Step Client Modal TUI Transition ($\Downarrow_{\text{ui}}$) }}
+by
+
+  --------------------------------------------------------------------------- :: Enter_Prefix
+  Normal , CtrlB ==> PrefixPending
+
+  --------------------------------------------------------------------------- :: Double_CtrlB_Passthrough
+  PrefixPending , CtrlB ==> Normal
+
+  --------------------------------------------------------------------------- :: Open_SessionChooser
+  PrefixPending , CharS ==> SessionChooser
+
+  --------------------------------------------------------------------------- :: Select_SessionChooser
+  SessionChooser , Enter ==> Normal
+
+  --------------------------------------------------------------------------- :: Cancel_SessionChooser
+  SessionChooser , Escape ==> Normal
+
+  --------------------------------------------------------------------------- :: Enter_CopyMode
+  PrefixPending , CharLBracket ==> CopyMode
+
+  --------------------------------------------------------------------------- :: Yank_OSC52_Exit_CopyMode
+  CopyMode , CharY ==> Normal
+
+  --------------------------------------------------------------------------- :: Escape_Exit_CopyMode
+  CopyMode , Escape ==> Normal
+
+defns
+JSmallStep :: '' ::=
+
+defn
+Sys -- alpha --> Sys' :: :: StepSys :: 'Step_'
+{{ com Small-Step Labelled Transition System ($\xrightarrow{\alpha}$) for Distributed tmux2 }}
+by
+
+  % 1. Deduplicated Key Event Forwarding (seq' > last_acked_seq)
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Key_Forward_Fresh
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G)) -- LblKey(cid, seq') --> SysConfig(SrvState(seq, seq0, FeedPty(G, data), L), CliState(cid, Normal, seq', seq, tok, G))
+
+  % 2. Duplicate Key Event Dropped Idempotently (seq' <= last_acked_seq)
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Key_Drop_Duplicate
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G)) -- LblKey(cid, seq') --> SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G))
+
+  % 3. PTY Output -> VTE Feed -> Dirty Row Diff Broadcast
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Pty_Output_Diff
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G)) -- LblPtyOut(pid) --> SysConfig(SrvState(seq, seq0, ApplyRowDiff(G, pid, data), L), CliState(cid, Normal, seq', seq, tok, ApplyRowDiff(G, pid, data)))
+
+  % 4. Network Disconnection -> Client Enters Reconnecting Hold Mode (Screen Preserved, Keys Buffered)
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Transport_Disconnect
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G)) -- LblDisconnect(cid) --> SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Reconnecting, seq', seq, tok, G))
+
+  % 5. Section 5 Fast Reconnect via FrameDiff Ring Buffer (last_srv_seq >= min_ring_seq)
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Reconnect_Delta_CatchUp
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Reconnecting, seq', seq0, tok, G')) -- LblReconnectDelta(cid, seq0) --> SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G))
+
+  % 6. Section 5 Reconnect Fallback via Full ScreenSnapshot (last_srv_seq < min_ring_seq)
+  -------------------------------------------------------------------------------------------------------------------------------------------------------- :: Reconnect_Snapshot_Fallback
+  SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Reconnecting, seq', seq'', tok, G')) -- LblReconnectSnap(cid, seq'') --> SysConfig(SrvState(seq, seq0, G, L), CliState(cid, Normal, seq', seq, tok, G))

@@ -73,6 +73,7 @@ private:
     struct CompressedChunk {
         size_t start_line_offset{0};
         size_t line_count{0};
+        bool is_compressed{false};
         std::vector<std::byte> compressed_data;
     };
 

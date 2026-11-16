@@ -16,8 +16,18 @@ namespace tmux2::pty {
 
 namespace {
 
+bool is_safe_term_name(std::string_view term) {
+    if (term.empty() || term.front() == '.' || term.front() == '-') {
+        return false;
+    }
+    if (term.find('/') != std::string_view::npos || term.find('\\') != std::string_view::npos) {
+        return false;
+    }
+    return true;
+}
+
 bool check_terminfo_file(const fs::path& base_dir, std::string_view term) {
-    if (term.empty()) return false;
+    if (!is_safe_term_name(term)) return false;
     std::error_code ec;
     if (!fs::exists(base_dir, ec) || !fs::is_directory(base_dir, ec)) {
         return false;
@@ -41,7 +51,7 @@ bool check_terminfo_file(const fs::path& base_dir, std::string_view term) {
 }
 
 bool check_terminfo_path_env(const char* env_val, std::string_view term) {
-    if (!env_val || *env_val == '\0') return false;
+    if (!env_val || *env_val == '\0' || !is_safe_term_name(term)) return false;
     std::istringstream stream(env_val);
     std::string dir;
     while (std::getline(stream, dir, ':')) {
@@ -53,7 +63,9 @@ bool check_terminfo_path_env(const char* env_val, std::string_view term) {
 }
 
 bool check_infocmp(std::string_view term) {
-    // Attempt fast fork-exec of infocmp -1 <term>
+    if (!is_safe_term_name(term)) return false;
+
+    // Attempt fast fork-exec of infocmp -1 -- <term>
     pid_t pid = fork();
     if (pid < 0) {
         return false;
@@ -67,7 +79,7 @@ bool check_infocmp(std::string_view term) {
             close(devnull);
         }
         std::string term_str(term);
-        execlp("infocmp", "infocmp", "-1", term_str.c_str(), static_cast<char*>(nullptr));
+        execlp("infocmp", "infocmp", "-1", "--", term_str.c_str(), static_cast<char*>(nullptr));
         _exit(1);
     }
 
@@ -81,7 +93,7 @@ bool check_infocmp(std::string_view term) {
 } // namespace
 
 bool has_terminfo(std::string_view term_name) {
-    if (term_name.empty()) return false;
+    if (!is_safe_term_name(term_name)) return false;
 
     // 1. Check $TERMINFO
     if (const char* terminfo_env = std::getenv("TERMINFO")) {

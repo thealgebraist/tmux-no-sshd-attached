@@ -21,6 +21,9 @@ void DirtyTracker::mark_dirty(uint16_t row) noexcept {
 }
 
 void DirtyTracker::mark_range(uint16_t start_row, uint16_t end_row) noexcept {
+    if (start_row >= rows_ || start_row >= end_row) {
+        return;
+    }
     uint16_t clamped_end = std::min(end_row, rows_);
     for (uint16_t r = start_row; r < clamped_end; ++r) {
         dirty_flags_[r] = true;

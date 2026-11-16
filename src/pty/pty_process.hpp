@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -89,6 +90,14 @@ public:
      * Updates exit code if child has terminated.
      */
     bool poll_exit();
+
+    /**
+     * Waits for the child process to terminate within the given timeout.
+     * If timeout < 0ms (default), blocks until child exits.
+     * Returns exit code if terminated, or std::nullopt on timeout.
+     */
+    std::optional<int> wait_for_exit(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(-1));
 
     /**
      * Sends a signal to the child process group (or child PID if group unavailable).

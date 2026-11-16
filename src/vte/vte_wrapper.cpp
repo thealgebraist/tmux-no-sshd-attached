@@ -314,8 +314,19 @@ void VteScreen::flush_damage() {
 }
 
 protocol::Cell VteScreen::convert_cell(const VTermScreenCell& sc) const {
-    char32_t cp = sc.chars[0] != 0 ? sc.chars[0] : U' ';
-    uint8_t w = static_cast<uint8_t>(sc.width > 0 ? sc.width : 0);
+    char32_t cp = U' ';
+    uint8_t w = 1;
+    if (sc.chars[0] == static_cast<uint32_t>(-1)) {
+        // Continuation cell of a wide (2-column) character
+        cp = 0;
+        w = 0;
+    } else if (sc.chars[0] == 0) {
+        cp = U' ';
+        w = static_cast<uint8_t>(sc.width > 0 ? sc.width : 1);
+    } else {
+        cp = sc.chars[0];
+        w = static_cast<uint8_t>(sc.width > 0 ? sc.width : 0);
+    }
 
     uint16_t flags = protocol::StyleFlags::None;
     if (sc.attrs.bold) flags |= protocol::StyleFlags::Bold;
@@ -508,13 +519,18 @@ void VteScreen::keyboard_key(int key, int modifiers) {
 void VteScreen::on_damage(int start_row, int end_row, int start_col, int end_col) {
     (void)start_col;
     (void)end_col;
-    dirty_tracker_.mark_range(static_cast<uint16_t>(start_row), static_cast<uint16_t>(end_row));
+    if (start_row >= 0 && end_row >= start_row) {
+        dirty_tracker_.mark_range(static_cast<uint16_t>(start_row), static_cast<uint16_t>(end_row));
+    }
 }
 
 void VteScreen::on_moverect(int dest_start_row, int dest_end_row, int src_start_row, int src_end_row) {
-    (void)src_start_row;
-    (void)src_end_row;
-    dirty_tracker_.mark_range(static_cast<uint16_t>(dest_start_row), static_cast<uint16_t>(dest_end_row));
+    if (dest_start_row >= 0 && dest_end_row >= dest_start_row) {
+        dirty_tracker_.mark_range(static_cast<uint16_t>(dest_start_row), static_cast<uint16_t>(dest_end_row));
+    }
+    if (src_start_row >= 0 && src_end_row >= src_start_row) {
+        dirty_tracker_.mark_range(static_cast<uint16_t>(src_start_row), static_cast<uint16_t>(src_end_row));
+    }
 }
 
 void VteScreen::on_movecursor(int row, int col, bool visible) {
@@ -597,9 +613,15 @@ int VteScreen::on_sb_popline(int cols, VTermScreenCell* cells) {
     for (int i = 0; i < cols; ++i) {
         if (i < static_cast<int>(popped->cells.size())) {
             const auto& src = popped->cells[i];
-            cells[i].chars[0] = src.codepoint;
-            cells[i].chars[1] = 0;
-            cells[i].width = src.width;
+            if (src.width == 0) {
+                cells[i].chars[0] = static_cast<uint32_t>(-1);
+                cells[i].chars[1] = 0;
+                cells[i].width = 1;
+            } else {
+                cells[i].chars[0] = src.codepoint;
+                cells[i].chars[1] = 0;
+                cells[i].width = src.width;
+            }
             cells[i].attrs.bold = (src.style.flags & protocol::StyleFlags::Bold) != 0;
             cells[i].attrs.italic = (src.style.flags & protocol::StyleFlags::Italic) != 0;
             cells[i].attrs.underline = (src.style.flags & protocol::StyleFlags::Underline) != 0 ? 1 : 0;

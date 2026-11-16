@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -213,6 +214,9 @@ std::expected<size_t, PtyReadError> PtyProcess::read_master(std::span<char> buff
     if (master_fd_ < 0) {
         return std::unexpected(PtyReadError::Eof);
     }
+    if (buffer.empty()) {
+        return static_cast<size_t>(0);
+    }
 
     ssize_t n = ::read(master_fd_, buffer.data(), buffer.size());
     if (n > 0) {
@@ -245,13 +249,16 @@ std::expected<size_t, PtyWriteError> PtyProcess::write_master(std::string_view d
     if (master_fd_ < 0) {
         return std::unexpected(PtyWriteError::BrokenPipe);
     }
+    if (data.empty()) {
+        return static_cast<size_t>(0);
+    }
 
     ssize_t n = ::write(master_fd_, data.data(), data.size());
     if (n >= 0) {
         return static_cast<size_t>(n);
     }
 
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
         return std::unexpected(PtyWriteError::WouldBlock);
     }
     if (errno == EPIPE || errno == EIO) {
@@ -315,6 +322,56 @@ bool PtyProcess::poll_exit() {
     }
 
     return false;
+}
+
+std::optional<int> PtyProcess::wait_for_exit(std::chrono::milliseconds timeout) {
+    if (!alive_ || child_pid_ <= 0) {
+        return exit_code_;
+    }
+
+    if (timeout < std::chrono::milliseconds(0)) {
+        // Blocking wait
+        int status = 0;
+        pid_t ret = 0;
+        do {
+            ret = waitpid(child_pid_, &status, 0);
+        } while (ret < 0 && errno == EINTR);
+
+        if (ret == child_pid_) {
+            alive_ = false;
+            if (WIFEXITED(status)) {
+                exit_code_ = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                exit_code_ = 128 + WTERMSIG(status);
+            } else {
+                exit_code_ = 0;
+            }
+            return exit_code_;
+        } else if (ret < 0 && errno == ECHILD) {
+            alive_ = false;
+            return exit_code_.has_value() ? exit_code_ : std::make_optional(0);
+        }
+        return std::nullopt;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    auto sleep_duration = std::chrono::milliseconds(1);
+    while (true) {
+        if (poll_exit()) {
+            return exit_code_;
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (elapsed >= timeout) {
+            break;
+        }
+        auto remaining = timeout - elapsed;
+        auto to_sleep = std::min(sleep_duration, remaining);
+        std::this_thread::sleep_for(to_sleep);
+        sleep_duration = std::min(sleep_duration * 2, std::chrono::milliseconds(20));
+    }
+
+    return poll_exit() ? exit_code_ : std::nullopt;
 }
 
 bool PtyProcess::send_signal(int sig) {

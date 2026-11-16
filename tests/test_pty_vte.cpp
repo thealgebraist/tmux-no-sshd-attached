@@ -621,3 +621,175 @@ TEST_CASE("VteScreen: Scrollback Buffer Integration on Row Overflow") {
     REQUIRE(oldest_line.has_value());
     CHECK(oldest_line->cells[0].codepoint == U'L');
 }
+
+TEST_CASE("PtyProcess: read_master with empty buffer returns 0 without EOF") {
+    tmux2::pty::PtyOptions options{
+        .cols = 80,
+        .rows = 24,
+        .command = "sleep 5"
+    };
+    auto spawn_res = tmux2::pty::PtyProcess::spawn(options);
+    REQUIRE(spawn_res.has_value());
+    auto proc = std::move(*spawn_res);
+
+    std::span<char> empty_buf{};
+    auto res = proc.read_master(empty_buf);
+    REQUIRE(res.has_value());
+    CHECK(*res == 0);
+
+    proc.send_signal(SIGKILL);
+    proc.close_master();
+}
+
+TEST_CASE("PtyProcess: wait_for_exit timeout and fast termination") {
+    // Fast exit
+    tmux2::pty::PtyOptions opt_fast{
+        .cols = 80,
+        .rows = 24,
+        .command = "exit 7"
+    };
+    auto spawn_fast = tmux2::pty::PtyProcess::spawn(opt_fast);
+    REQUIRE(spawn_fast.has_value());
+    auto proc_fast = std::move(*spawn_fast);
+
+    auto exited = proc_fast.wait_for_exit(2s);
+    REQUIRE(exited.has_value());
+    CHECK(*exited == 7);
+    CHECK_FALSE(proc_fast.is_alive());
+    REQUIRE(proc_fast.exit_code().has_value());
+    CHECK(*proc_fast.exit_code() == 7);
+
+    // Timeout case
+    tmux2::pty::PtyOptions opt_slow{
+        .cols = 80,
+        .rows = 24,
+        .command = "sleep 10"
+    };
+    auto spawn_slow = tmux2::pty::PtyProcess::spawn(opt_slow);
+    REQUIRE(spawn_slow.has_value());
+    auto proc_slow = std::move(*spawn_slow);
+
+    auto slow_exit = proc_slow.wait_for_exit(50ms);
+    CHECK_FALSE(slow_exit.has_value());
+    CHECK(proc_slow.is_alive());
+
+    proc_slow.send_signal(SIGKILL);
+    proc_slow.close_master();
+    (void)proc_slow.wait_for_exit(2s);
+}
+
+TEST_CASE("Terminfo: path traversal and flag-like terminal name rejection") {
+    CHECK_FALSE(tmux2::pty::has_terminfo("../../etc/passwd"));
+    CHECK_FALSE(tmux2::pty::has_terminfo("../xterm"));
+    CHECK_FALSE(tmux2::pty::has_terminfo("-V"));
+    CHECK_FALSE(tmux2::pty::has_terminfo("--help"));
+    CHECK_FALSE(tmux2::pty::has_terminfo("/bin/sh"));
+    CHECK_FALSE(tmux2::pty::has_terminfo("xterm;rm -rf /"));
+}
+
+TEST_CASE("VteScreen: wide character continuation cell handling") {
+    tmux2::vte::VteScreen vte(80, 24);
+    // Write an emoji at col 0: 🚀 (width 2) followed by 'A'
+    vte.feed("🚀A");
+    vte.flush_damage();
+
+    auto c0 = vte.get_cell(0, 0);
+    CHECK(c0.codepoint == 0x1F680);
+    CHECK(c0.width == 2);
+
+    // Col 1 must be the continuation cell with width 0 and codepoint 0
+    auto c1 = vte.get_cell(1, 0);
+    CHECK(c1.codepoint == 0);
+    CHECK(c1.width == 0);
+
+    // Col 2 is 'A'
+    auto c2 = vte.get_cell(2, 0);
+    CHECK(c2.codepoint == U'A');
+    CHECK(c2.width == 1);
+}
+
+TEST_CASE("VteScreen: move semantics") {
+    tmux2::vte::VteScreen vte1(80, 24);
+    vte1.feed("Moved terminal screen");
+    vte1.flush_damage();
+
+    // Move construct
+    tmux2::vte::VteScreen vte2(std::move(vte1));
+    CHECK(vte2.cols() == 80);
+    CHECK(vte2.rows() == 24);
+    CHECK(vte2.get_cell(0, 0).codepoint == U'M');
+
+    // Feed to moved-to vte2
+    vte2.feed("\r\nSecond line");
+    vte2.flush_damage();
+    CHECK(vte2.get_cell(0, 1).codepoint == U'S');
+
+    // Move assign
+    tmux2::vte::VteScreen vte3(40, 10);
+    vte3 = std::move(vte2);
+    CHECK(vte3.cols() == 80);
+    CHECK(vte3.rows() == 24);
+    CHECK(vte3.get_cell(0, 0).codepoint == U'M');
+    CHECK(vte3.get_cell(0, 1).codepoint == U'S');
+}
+
+TEST_CASE("VteScreen: mouse mode tracking and event injection") {
+    tmux2::vte::VteScreen vte(80, 24);
+    CHECK(vte.mouse_mode() == 0);
+
+    std::string output_received;
+    vte.set_output_callback([&](std::string_view out) {
+        output_received.append(out);
+    });
+
+    // Enable normal mouse tracking (CSI ? 1000 h)
+    vte.feed("\033[?1000h");
+    vte.flush_damage();
+    CHECK(vte.mouse_mode() != 0);
+
+    // Simulate mouse button click at col 10, row 5
+    vte.mouse_move(10, 5);
+    vte.mouse_button(1, true); // Button 1 press
+    vte.mouse_button(1, false); // Button 1 release
+
+    // libvterm should have produced mouse sequence in output_received
+    CHECK_FALSE(output_received.empty());
+    CHECK(output_received.starts_with("\033[M"));
+
+    // Disable mouse tracking
+    vte.feed("\033[?1000l");
+    vte.flush_damage();
+    CHECK(vte.mouse_mode() == 0);
+}
+
+TEST_CASE("ScrollbackBuffer: stress test with 1000+ lines and chunk eviction") {
+    // 32 lines per chunk, 500 max lines
+    tmux2::vte::ScrollbackBuffer sb(500, 32);
+
+    for (size_t i = 0; i < 1200; ++i) {
+        tmux2::protocol::ScrollbackLine line;
+        line.wrapped = (i % 3 == 0);
+        line.cells.resize(80);
+        for (size_t c = 0; c < 80; ++c) {
+            line.cells[c].codepoint = static_cast<char32_t>('A' + (i % 26));
+            line.cells[c].width = 1;
+        }
+        sb.push_line(std::move(line));
+    }
+
+    CHECK(sb.total_lines() <= 500);
+    CHECK(sb.total_lines() >= 450);
+
+    // Retrieve oldest available line
+    auto oldest = sb.get_line(0);
+    REQUIRE(oldest.has_value());
+    CHECK(oldest->cells.size() == 80);
+
+    // Retrieve slice of 50 lines across chunk boundaries
+    auto slice = sb.get_slice(50, 50);
+    CHECK(slice.size() == 50);
+
+    // Memory usage should remain compact due to zstd compression
+    CHECK(sb.memory_usage_bytes() > 0);
+    CHECK(sb.memory_usage_bytes() < 500 * 80 * sizeof(tmux2::protocol::Cell));
+}

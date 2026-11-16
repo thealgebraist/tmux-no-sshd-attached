@@ -34,11 +34,20 @@ std::optional<protocol::ScrollbackLine> ScrollbackBuffer::pop_line() {
 
     if (!chunks_.empty()) {
         size_t last_idx = chunks_.size() - 1;
+        size_t recorded_chunk_lines = chunks_.back().line_count;
         auto lines = decompress_chunk(last_idx);
-        chunk_lines_count_ -= chunks_.back().line_count;
+        chunk_lines_count_ -= recorded_chunk_lines;
         chunks_.pop_back();
-        if (decompressed_cache_.chunk_index == last_idx) {
-            decompressed_cache_.chunk_index = static_cast<size_t>(-1);
+        decompressed_cache_.chunk_index = static_cast<size_t>(-1);
+        decompressed_cache_.lines.clear();
+
+        if (lines.empty()) {
+            total_lines_ = (total_lines_ >= recorded_chunk_lines) ? (total_lines_ - recorded_chunk_lines) : 0;
+            return std::nullopt;
+        }
+
+        if (lines.size() != recorded_chunk_lines) {
+            total_lines_ = total_lines_ - recorded_chunk_lines + lines.size();
         }
 
         active_chunk_ = std::move(lines);
@@ -171,6 +180,7 @@ void ScrollbackBuffer::flush_active_chunk() {
         CompressedChunk chunk;
         chunk.start_line_offset = chunk_lines_count_;
         chunk.line_count = active_chunk_.size();
+        chunk.is_compressed = true;
         chunk.compressed_data = std::move(*comp_res);
 
         chunk_lines_count_ += chunk.line_count;
@@ -180,6 +190,7 @@ void ScrollbackBuffer::flush_active_chunk() {
         CompressedChunk chunk;
         chunk.start_line_offset = chunk_lines_count_;
         chunk.line_count = active_chunk_.size();
+        chunk.is_compressed = false;
         chunk.compressed_data = writer.take();
 
         chunk_lines_count_ += chunk.line_count;
@@ -217,11 +228,14 @@ std::vector<protocol::ScrollbackLine> ScrollbackBuffer::decompress_chunk(size_t 
     const auto& chunk = chunks_[chunk_idx];
     std::vector<std::byte> raw_data;
 
-    auto decomp_res = decompressor_.decompress(chunk.compressed_data);
-    if (decomp_res) {
-        raw_data = std::move(*decomp_res);
+    if (chunk.is_compressed) {
+        auto decomp_res = decompressor_.decompress(chunk.compressed_data);
+        if (decomp_res) {
+            raw_data = std::move(*decomp_res);
+        } else {
+            return {};
+        }
     } else {
-        // May have been stored raw
         raw_data = chunk.compressed_data;
     }
 

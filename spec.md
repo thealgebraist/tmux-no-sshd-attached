@@ -1,9 +1,9 @@
 # `tmux2` Technical Specification
 **An mTLS-Native, Detachable, Persistent Multi-Session Terminal Multiplexer**
 
-- **Status:** Draft Specification (v1.0)
-- **Target Architecture:** Direct Client-to-Daemon over TLS 1.3 (mTLS) via QUIC and TCP
-- **Core Goal:** Eliminate the `ssh -> remote PTY -> tmux attach` workflow by replacing local-only `AF_UNIX` + `SCM_RIGHTS` IPC with a network-native, mTLS-authenticated multiplexing protocol supporting multiple sessions, windows, and panes.
+- **Status:** Complete Specification (v1.0 — C++23 Cross-Platform Architecture)
+- **Target Architecture:** Direct Client-to-Daemon over TLS 1.3 (mTLS) via OpenSSL 3.5+ QUIC and TCP, plus local `AF_UNIX` auto-spawn mode.
+- **Core Goal:** Eliminate the legacy `ssh -> remote PTY -> tmux attach` workflow by replacing local-only `AF_UNIX` + `SCM_RIGHTS` IPC with a network-native, mTLS-authenticated multiplexing protocol supporting multiple sessions, windows, and panes across Linux and macOS.
 
 ---
 
@@ -26,47 +26,49 @@ Because `SCM_RIGHTS` file-descriptor passing cannot cross a network socket:
 | **Eternal Terminal (`et`)** | TCP (Custom framing) | No (Single pipe; needs `tmux` inside) | No (Requires `ssh` to bootstrap token) | Yes | Yes |
 | **WezTerm Mux Server** | TCP + TLS / mTLS | Yes (Workspaces, Tabs, Panes) | Yes (With manual/CA certs) | No (Requires WezTerm GUI client) | Yes |
 | **Zellij / `shpool`** | Unix Socket (+ Web UI in Zellij) | Zellij: Yes / `shpool`: Sessions only | CLI requires `ssh` (Web uses HTTPS) | Yes | Via SSH reconnect |
-| **`tmux2` (Proposed)** | **QUIC + TCP with TLS 1.3 mTLS** | **Yes (Full `tmux` hierarchy)** | **Yes (Direct mTLS to daemon)** | **Yes (Pure TUI/CLI client)** | **Yes (Connection migration + sequence resume)** |
+| **`tmux2` (C++23 v1)** | **QUIC + TCP with TLS 1.3 mTLS & AF_UNIX** | **Yes (Full `tmux` hierarchy)** | **Yes (Direct mTLS to daemon)** | **Yes (Pure TUI/CLI client)** | **Yes (Connection migration + sequence resume)** |
 
 ---
 
 ## 2. System Architecture
 
-`tmux2` splits the traditional terminal multiplexer into a **Network-Native State Server (`tmux2d`)** and a **Local Rendering & Input Client (`tmux2`)**.
+`tmux2` is built as a single, unified C++23 binary (`tmux2`) that acts as both the client and the background daemon (`tmux2d` as a symlink or `tmux2 daemon` subcommand).
 
 ```
 +-------------------------------------------------------------------------+
 | Local Workstation (Any Terminal: Kitty, Ghostty, Alacritty, iTerm2...)  |
 |                                                                         |
 |  +-------------------------------------------------------------------+  |
-|  | `tmux2` Client Process                                            |  |
-|  |  - Puts local TTY into raw mode                                   |  |
-|  |  - Parses local key/mouse/paste/resize events                     |  |
-|  |  - Renders server frame diffs & status UI to local stdout         |  |
-|  |  - Client-side reconnect & outbound input ring buffer             |  |
+|  | `tmux2` Client Mode (TUI)                                         |  |
+|  |  - POSIX raw-mode TTY RAII wrapper (tcgetattr / tcsetattr)        |  |
+|  |  - High-performance VT/SGR input parser (keys, mouse, paste)      |  |
+|  |  - Configurable Prefix Engine (Ctrl-b) & Interactive Overlays     |  |
+|  |  - Atomic Frame Renderer with DECSET 2026 synchronized output     |  |
+|  |  - Outbound input ring buffer for zero-drop seamless reconnect    |  |
 |  +-------------------------------------------------------------------+  |
-+------------------------------------+------------------------------------+
-                                     |
-                                     |  TLS 1.3 with Mutual TLS (mTLS)
-                                     |  Primary: QUIC (UDP/8443)
-                                     |  Fallback: Multiplexed TCP (TCP/8443)
-                                     v
++--------------------+-------------------------------+--------------------+
+                     |                               |
+                     | Local 0600 AF_UNIX            | TLS 1.3 Mutual TLS (mTLS)
+                     | Socket (Auto-Spawn)           | Primary: OpenSSL QUIC (UDP/8443)
+                     |                               | Fallback: OpenSSL TCP (TCP/8443)
+                     v                               v
 +-------------------------------------------------------------------------+
-| Remote Server (`tmux2d`)                                                |
+| Remote or Local Host (`tmux2 daemon` / `tmux2d`)                        |
 |                                                                         |
 |  +-------------------------------------------------------------------+  |
-|  | Privilege-Separated mTLS Gatekeeper (System Mode) or User Listener|  |
-|  |  - Verifies client X.509 cert against trusted CA / pinned certs   |  |
-|  |  - Maps cert identity (SAN/CN/Fingerprint) -> UNIX UID            |  |
+|  | Single-Threaded Lock-Free C++23 Reactor                           |  |
+|  |  - Linux: epoll(7) / macOS: kqueue(2) + poll(2) TTY fallback       |  |
+|  |  - Min-heap timer queue driving SSL_get_event_timeout             |  |
+|  |  - Zero-allocation non-blocking socket dispatch                   |  |
 |  +-------------------------------------------------------------------+  |
-|                                     | (Local IPC or In-Process)         |
+|                                     |                                   |
 |  +-------------------------------------------------------------------+  |
-|  | Per-User `tmux2d` Session Engine                                  |  |
+|  | Per-User Session Engine (Rootless Mode A)                         |  |
 |  |                                                                   |  |
 |  |  +-- Session "work" ------------------+  +-- Session "deploy" -+  |  |
 |  |  |  +-- Window 0: "editor" ---------+ |  |  +-- Window 0 ----+ |  |  |
-|  |  |  | Pane 0 (PTY + VTE Grid/Hist)  | |  |  | Pane 0 (PTY)   | |  |  |
-|  |  |  | Pane 1 (PTY + VTE Grid/Hist)  | |  |  +----------------+ |  |  |
+|  |  |  | Pane 0 (PTY + VteScreen Grid) | |  |  | Pane 0 (PTY)   | |  |  |
+|  |  |  | Pane 1 (PTY + VteScreen Grid) | |  |  +----------------+ |  |  |
 |  |  |  +-------------------------------+ |  +---------------------+  |  |
 |  |  |  +-- Window 1: "logs" -----------+ |                           |  |
 |  |  +------------------------------------+                           |  |
@@ -75,236 +77,241 @@ Because `SCM_RIGHTS` file-descriptor passing cannot cross a network socket:
 ```
 
 ### 2.1 Object Hierarchy
-`tmux2d` preserves `tmux`'s 3-tier hierarchy per user:
-1. **Session (`SessionId`, `name`):** Named persistent workspace (e.g., `dev`, `infra`, `ml-train`). Holds an ordered map of Windows, active window pointer, last window pointer, session environment variables, options, and a set of currently attached `ClientAttachment` handles.
-2. **Window (`WindowId`, `index`, `name`):** Holds a binary/n-ary split **Layout Tree** (horizontal split, vertical split, tiled, zoomed pane) and window dimensions determined by policy (`smallest`, `largest`, `latest`, or `manual`).
+`tmux2` preserves and refines the traditional 3-tier hierarchy:
+1. **Session (`SessionId`, `name`):** Named persistent workspace (e.g., `dev`, `infra`, `ml-train`). Holds an ordered map of Windows, active window pointer, last window pointer, session environment variables, options, and a set of attached `ClientAttachment` handles.
+2. **Window (`WindowId`, `index`, `name`):** Holds a split layout tree (horizontal split, vertical split, tiled, zoomed pane) and dimensions governed by sizing policy (`latest`, `smallest`, `largest`, or `manual`). In v1, `window-size = latest` dynamically sizes the window to the most recently active attached client.
 3. **Pane (`PaneId`):**
-   - Owns a single server-side PTY master/slave pair (`openpty(3)`) and child process group (`pid`).
-   - Owns a server-side **Virtual Terminal Emulator (VTE) State Machine** (screen cell matrix, alternate screen matrix, cursor state, character sets, terminal modes, and a configurable compressed scrollback ring buffer, e.g., 50,000 lines).
+   - Owns a server-side PTY master/slave pair (`openpty(3)` via `<pty.h>` on Linux and `<util.h>` on macOS) and child process group (`pid`).
+   - Owns a server-side **`VteScreen` Virtual Terminal Emulator** powered by a C++23 RAII wrapper around `libvterm` (grid cells, styles, 24-bit Truecolor RGB, cursor tracking, alternate screen buffer, mouse reporting, and OSC 52 clipboard callbacks).
+   - Owns a high-performance **`ScrollbackBuffer`** ring buffer utilizing `libzstd` chunked compression for memory-efficient multi-thousand-line storage (e.g., 50,000 lines).
 
-### 2.2 Server-Side State vs. Client-Side Rendering
-Unlike raw byte-stream forwarders, `tmux2d` parses all child PTY output into its in-memory VTE grid on the server:
-- **Instant Reattachment:** If a pane outputs 10 GB of logs while detached, reattaching sends only the current visible screen matrix (~10–50 KB compressed) plus scrollback metadata, completing in `< 20 ms`.
-- **Terminal Independence:** The wire protocol transmits structured **Cell Grid Snapshots & Row/Run Diffs** rather than raw `terminfo` strings tied to a single `$TERM`. Two clients attached to the same session from different terminal emulators each render optimally for their local terminal capabilities.
-- **Single-Connection Session Switching:** Switching between Session `A` and Session `B` (`Prefix + s` or `:switch-client -t B`) happens in-band over the existing mTLS connection by swapping the client's subscribed `SessionId` on the server and transmitting a fresh `ScreenSnapshot` for Session `B`.
+### 2.2 Local Auto-Spawn Mode (`AF_UNIX`)
+When executed locally without remote host flags (`tmux2`, `tmux2 new`, `tmux2 attach`), `tmux2` connects via a secure local Unix domain socket (`0600` permissions at `$XDG_RUNTIME_DIR/tmux2/default.sock` or `~/.local/state/tmux2/default.sock` / `/tmp/tmux2-<uid>/default.sock`). If the socket does not exist or fails connection, the client automatically daemonizes and spawns the background daemon using platform-native binary resolution:
+- **macOS:** `_NSGetExecutablePath()`
+- **Linux:** `/proc/self/exe`
+
+The client polls the socket with a brief exponential backoff (up to 1.5s total), ensuring instantaneous, zero-configuration local startup matching `tmux` ergonomics.
+
+### 2.3 Server-Side State vs. Client-Side Rendering
+Unlike raw byte-stream forwarders, `tmux2` parses all child PTY output into its in-memory VTE grid on the server:
+- **Instant Reattachment:** If a pane outputs 10 GB of logs while detached, reattaching sends only the current visible screen snapshot (~10–50 KB compressed) plus scrollback metadata in `< 20 ms`.
+- **Terminal Independence:** The wire protocol transmits structured **Cell Grid Snapshots & Row Diffs** rather than raw `terminfo` escape strings. Two clients attached to the same session with different terminal sizes or color palettes render cleanly and independently.
+- **In-Band Session Switching:** Switching between sessions (`Prefix + s` or `:switch-client -t <name>`) occurs over the existing mTLS or local socket connection by updating subscription state and receiving a new `ScreenSnapshot`.
+- **Multi-Client Detach Semantics:** Running `attach -d` or connecting with the detach flag cleanly detaches all other clients attached to that session, notifying them via `MsgDetachNotice`.
 
 ---
 
 ## 3. Security, Authentication, and Privilege Model (mTLS)
 
-### 3.1 TLS 1.3 Mutual Authentication Requirements
-All network communication uses **TLS 1.3** (RFC 8446) with mandatory client certificate authentication (`CertificateRequest` in server handshake):
+### 3.1 TLS 1.3 Mutual Authentication
+All network communication uses **TLS 1.3** (RFC 8446) with mandatory mutual certificate authentication (mTLS):
 - **Cipher Suites:** `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_128_GCM_SHA256`.
-- **Key Types:** Ed25519 (recommended default) or ECDSA P-256 (`secp256r1`). RSA keys `< 3072 bits` are rejected.
+- **Key Types:** Ed25519 X.509v3 certificates (primary, fast, small footprint) or ECDSA P-256. RSA keys `< 3072 bits` are rejected.
 - **ALPN Identifier:** `tmux2/1`.
-- **0-RTT Policy:** TLS 1.3 0-RTT early data is **disabled** for control/input commands to prevent replay attacks; fast resumption uses TLS 1.3 session tickets (`PSK` with `psk_dhe_ke` forward secrecy) combined with `tmux2`'s application-layer sequence numbers.
+- **0-RTT Policy:** TLS 1.3 0-RTT early data is disabled for interactive input commands to prevent replay attacks; resumption relies on TLS session tickets combined with application-level `client_seq` deduplication.
 
 ### 3.2 Certificate Verification & Identity Mapping
 1. **Server Verification (by Client):**
-   - The client validates the server certificate against a configured Root CA (`ca_cert` in client config) and verifies the hostname/IP against the server certificate's X.509 Subject Alternative Name (`SAN`).
-   - **Trust-On-First-Use (TOFU) / Pinning Option:** For single-user self-signed setups, the client can alternatively pin the server certificate's SPKI SHA-256 fingerprint.
+   - The client validates the server certificate against the configured Root CA (`ca_cert` in profile).
+   - Hostname/IP is matched against the server certificate's X.509 Subject Alternative Name (`SAN`).
 2. **Client Verification (by Server):**
-   - The server verifies the client's certificate chain against its configured `client_ca_cert` bundle and checks expiry plus optional CRL / pinned fingerprint revocation list.
-   - **Principal Mapping:** The server extracts the authenticated identity from the client certificate in priority order:
-     1. X.509 `SAN` URI matching `spiffe://<trust-domain>/user/<username>` or `tmux2://user/<username>`
-     2. X.509 `SAN` rfc822Name / Common Name (`CN`)
-     3. Explicit SHA-256 certificate fingerprint mapped in `/etc/tmux2/authorized_clients.toml` or `~/.config/tmux2/authorized_clients.toml`.
-   - **Role-Based Access Control (Optional Cert Extensions):** Client certificates may carry custom extensions or SAN attributes restricting them to specific sessions (e.g., `role=readonly` for pair-programming spectators or `allowed_sessions=["pair-debug"]`).
+   - The server verifies the client certificate chain against `client_ca_cert`.
+   - Identity is resolved via X.509 `SAN` URI (`tmux2://user/<username>`), SAN DNS/email, or Common Name (`CN`).
+3. **Deferred Extensions (v2+):**
+   - Trust-On-First-Use (TOFU) automatic pinning without CA bundles is explicitly deferred to v2+.
+   - Fine-grained certificate-based Role-Based Access Control (RBAC) extensions (e.g. read-only spectator certs or session whitelists) are deferred to v2+. In v1, authorized client profiles carry standard user identities verified against local user access lists.
 
 ### 3.3 Daemon Deployment Modes
 
-#### Mode A: Rootless Per-User Daemon (Single-User / Dev VM)
-- Runs directly under the target user account (e.g., via `systemd --user` with `loginctl enable-linger $USER`).
-- Listens on an unprivileged port (default `8443`).
-- Reads `~/.config/tmux2/server.toml` and `~/.config/tmux2/pki/`.
-- Requires zero root privileges to install or run.
+#### Mode A: Rootless Per-User Daemon (v1 Primary)
+- Runs directly under the target user account without root privileges.
+- Supports background execution via `--daemonize`.
+- Built-in generators for service managers:
+  - **Linux:** `systemd --user` unit (`tmux2 daemon --install-service` -> `~/.config/systemd/user/tmux2.service`).
+  - **macOS:** `LaunchAgent` plist generator (`~/Library/LaunchAgents/com.tmux2.daemon.plist`).
+- Default network listen port: UDP/TCP `8443`.
+- Local socket created with `0600` permissions accessible only to the owner UID.
 
-#### Mode B: Privilege-Separated Multi-User System Daemon (`/usr/sbin/tmux2d`)
-Designed to replace `sshd` on multi-user hosts without running complex parsing logic as `root`:
-1. **`tmux2d-listener` (Supervisor):** Binds port `8443` (or `443`), spawns unprivileged `tmux2d-tls` worker processes running in a `chroot` + `seccomp` sandbox as user `_tmux2_tls`.
-2. **`tmux2d-tls` (Handshake & Proxy Worker):** Terminates the TLS 1.3 mTLS handshake, validates the client certificate, resolves the target UNIX username, and requests the supervisor to connect to that user's socket `/run/tmux2/<uid>/server.sock`.
-3. **`tmux2d-user` (Per-UID Session Server):** If not already running for `<uid>`, the supervisor spawns `tmux2d-user` after dropping privileges (`setgroups`, `setgid`, `setuid`, PAM session initialization, cgroup placement). The authenticated stream is spliced to `tmux2d-user`.
-4. **Isolation Guarantee:** Compromise of the TLS parser does not yield root or access to any user's sessions; each user's panes and sessions live in their own UID process tree.
+#### Mode B: Privilege-Separated Multi-User Root Daemon (Deferred to v2+)
+- Multi-user privilege-separated root daemon (`tmux2d-listener` / `tmux2d-tls` / `tmux2d-user`) designed to replace system `sshd` is deferred to v2+. In v1, multi-user systems run independent rootless Mode A daemons per user on designated user ports or via user-space port forwarding.
 
 ### 3.4 Built-In PKI Tooling (`tmux2 pki`)
-To make mTLS as ergonomic as `ssh-keygen` + `ssh-copy-id`:
-- `tmux2 pki init --host dev.example.com`: Generates an Ed25519 Root CA (`ca.key`, `ca.crt`), server certificate (`server.key`, `server.crt`), and default client certificate (`client.key`, `client.crt`).
-- `tmux2 pki export-client <name> --server dev.example.com:8443 > dev.tmux2-profile`: Outputs a single portable TOML profile containing the server address, CA cert, client cert, and client private key (encrypted with an optional passphrase or sealed for OS keychain).
-- `tmux2 profile import dev.tmux2-profile`: Installs the profile on the client machine so `tmux2 -H dev` works immediately.
+`tmux2` includes a complete OpenSSL 3.5+ Ed25519 X.509v3 PKI engine:
+- `tmux2 pki init --host dev.example.com`: Generates a dedicated Root CA (`ca.key`, `ca.crt`), server certificate (`server.key`, `server.crt`), and initial client certificate (`client.key`, `client.crt`) with proper SAN entries.
+- `tmux2 pki export-client <name> --server dev.example.com:8443 > dev.tmux2-profile`: Bundles the CA cert, client cert, private key, and connection endpoint into a single TOML profile file saved with strict `0600` permissions.
+- `tmux2 profile import dev.tmux2-profile`: Installs the profile into `~/.config/tmux2/profiles/dev.toml` with `0600` permissions.
 
 ---
 
 ## 4. Transport & Wire Protocol Specification
 
 ### 4.1 Dual-Transport Abstraction (QUIC Primary, TCP Fallback)
-`tmux2` defines a transport-agnostic stream abstraction over two TLS 1.3 carriers:
+`tmux2` uses a unified transport abstraction over OpenSSL 3.5+:
 
 1. **QUIC Transport (Default, UDP/8443):**
-   - Uses native QUIC bidirectional and unidirectional streams:
-     - **Stream 0 (Bidirectional Control & Input Stream):** Session RPCs (list, create, attach, switch, detach, kill), keyboard/mouse input events, window resize events, heartbeats.
-     - **Stream 2 (Server -> Client Render Stream):** High-priority screen snapshots and incremental frame diffs for the currently attached session/window.
-     - **Dynamic Streams (Bidirectional):** On-demand bulk operations (e.g., fetching historical scrollback pages, searching scrollback on the server, OSC 52 clipboard sync, or remote file/buffer transfer) so bulk transfers never cause head-of-line blocking on typing or screen rendering.
-   - **QUIC Connection Migration:** If the client's source IP/port changes (Wi-Fi to cellular), QUIC migrates the connection seamlessly without a new TLS handshake.
+   - Utilizes OpenSSL 3.5+ native QUIC API (`OSSL_QUIC_client_method()`).
+   - Stream 0: Bidirectional Control & Interactive Input.
+   - Stream 2: Server-to-Client High-Priority Render Stream (`ScreenSnapshot`, `CellRowDiff`).
+   - Dynamic Streams: On-demand bulk transfers (scrollback slice paging, OSC 52 sync) without head-of-line blocking.
+   - Connection Migration: Survives network switches (Wi-Fi to LTE) without session drops.
 
 2. **TCP + TLS 1.3 Transport (Fallback, TCP/8443):**
-   - When UDP is blocked, the client connects over TCP with TLS 1.3 and runs a lightweight multiplexed framing header over the TLS byte stream:
-     ```
-     +-------------------+-------------------+-------------------+-----------------------+
-     | Stream ID (u16)   | Msg Type (u8)     | Flags (u8)        | Payload Length (u32)  |
-     +-------------------+-------------------+-------------------+-----------------------+
-     | Payload Bytes (Protobuf / MsgPack / bincode, optionally zstd-compressed)          |
-     +-----------------------------------------------------------------------------------+
-     ```
-   - `Flags`: `0x01 = ZSTD_COMPRESSED`, `0x02 = FIN_STREAM`, `0x04 = PRIORITY_URGENT`.
+   - Automatically engaged when UDP is blocked or throttled, coordinated via a Happy Eyeballs parallel connection race.
+   - Employs a framing header over the TLS 1.3 stream.
 
-### 4.2 Connection Lifecycle & Session Handshake
+3. **Local AF_UNIX Transport:**
+   - Raw binary frame transport over local non-blocking Unix domain socket with `0600` file mode.
 
+### 4.2 Zero-Codegen Little-Endian Binary Wire Codec
+The wire protocol uses a zero-copy, zero-codegen binary format using standard C++23 `<bit>`, `std::span`, and `std::expected`. All multibyte integers are strictly Little-Endian.
+
+#### Frame Header (8 bytes)
 ```
-Client (`tmux2`)                                         Server (`tmux2d`)
-   |                                                            |
-   |--- 1. TLS 1.3 Handshake (ALPN: "tmux2/1", mTLS Certs) ---->|
-   |                                                            | (Verify Client Cert
-   |                                                            |  & Map to UID)
-   |--- 2. ClientHello { protocol_ver, client_instance_id,      |
-   |       term_caps, resume_token?, last_srv_seq, target } --->|
-   |                                                            |
-   |<-- 3. ServerHello { server_version, assigned_client_id,    |
-   |       resume_token, last_client_seq_acked, session_list } -|
-   |                                                            |
-   |    [If target == Attach(session_name, create_if_missing)]  |
-   |<-- 4. AttachAck { session_id, window_id, layout_tree } ----|
-   |<-- 5. ScreenSnapshot { panes: [GridState], status_bar } ---|
-   |                                                            |
-   |=== 6. Interactive Loop (InputEvents <-> FrameDiffs) =======|
++-------------------+-------------------+-------------------+-----------------------+
+|  Magic (u16)      |   Type (u8)       |   Flags (u8)      |   Payload Len (u32)   |
+|   0x5432 ("T2")   |   MsgType         |   Bitmask         |   0 .. 64 MiB         |
++-------------------+-------------------+-------------------+-----------------------+
 ```
+- `Magic`: `0x5432` (`'2'` in low byte, `'T'` in high byte).
+- `Flags`: `0x01 = Compressed (zstd)`, `0x02 = Urgent`.
 
-### 4.3 Core Protocol Messages
-
-#### A. Control & Multi-Session Management Messages
-Because the protocol separates *connection* from *session attachment*, a client can perform one-shot CLI operations or switch sessions interactively without reconnecting:
-
-| Message | Direction | Description |
+#### Core Message Types
+| Value | Type | Description |
 | :--- | :--- | :--- |
-| `ClientHello` | C -> S | Negotiates protocol version, reports terminal capabilities (`truecolor`, `kitty_kbd`, `sgr_mouse`, `osc52`), and optionally requests fast resume via `resume_token`. |
-| `ServerHello` | S -> C | Confirms authentication, returns `resume_token`, acks the last processed `client_seq`, and provides server metadata. |
-| `ListSessionsReq` / `Resp` | C <-> S | Returns all sessions on the server: `[{ session_id, name, created_at, window_count, attached_clients, preview_summary }]`. |
-| `NewSessionReq` / `Resp` | C <-> S | Creates a new session (`name`, initial `window_name`, `cwd`, `command`, `env`, `detached: bool`). |
-| `AttachSessionReq` / `Resp` | C <-> S | Binds this client connection to `session_id` (or `session_name`), optionally with `read_only: bool` or `size_policy`. |
-| `SwitchSessionReq` / `Resp` | C <-> S | Atomically detaches the client from its current session and attaches it to another session on the same server over the existing mTLS connection. |
-| `DetachReq` / `DetachNotice` | C <-> S | Cleanly detaches the client (leaving the session running on the server) or notifies the client that another client ran `detach-client`. |
-| `KillSessionReq` / `Resp` | C <-> S | Terminates a session and all its windows/panes. |
-| `CommandRpcReq` / `Resp` | C <-> S | Executes any `tmux2` command DSL expression remotely (e.g., `split-window -h`, `new-window -n logs`, `send-keys -t build:0.1 "make test" Enter`, `capture-pane`). |
+| `0x01` | `ClientHello` | Handshake: client protocol version, instance ID, terminal capabilities, resume token. |
+| `0x02` | `ServerHello` | Handshake response: assigned client ID, session list, resume token. |
+| `0x03` | `ListSessionsReq` | Query running sessions. |
+| `0x04` | `ListSessionsResp` | Session metadata array (`id`, `name`, `windows`, `created_at`). |
+| `0x05` | `NewSessionReq` | Create session (`name`, `window_name`, `cols`, `rows`, `command`). |
+| `0x06` | `NewSessionResp` | Session creation result (`session_id`). |
+| `0x07` | `AttachSessionReq` | Attach client to session (`session_id`/`name`, `read_only`, `detach_others`). |
+| `0x08` | `AttachSessionResp` | Attach acknowledgment (`layout_tree`, active pane). |
+| `0x09` | `DetachReq` | Clean client detach. |
+| `0x0A` | `DetachNotice` | Server notice to client (e.g. kicked or session terminated). |
+| `0x0B` | `SwitchSessionReq` | In-band session switch (`target_session_id`). |
+| `0x0C` | `SwitchSessionResp`| Switch acknowledgment. |
+| `0x0D` | `KillSessionReq` | Terminate session and its child PTY processes. |
+| `0x0E` | `KillSessionResp` | Termination status. |
+| `0x10` | `KeyEvent` | Client keystroke (`client_seq`, `pane_id`, `key_code`, `modifiers`, `raw_bytes`). |
+| `0x11` | `MouseEvent` | Mouse click/drag/scroll (`client_seq`, `pane_id`, `button`, `kind`, `col`, `row`). |
+| `0x12` | `PasteEvent` | Bracketed paste payload (`client_seq`, `pane_id`, `data`). |
+| `0x13` | `ClientResize` | Window/pane resize notification (`cols`, `rows`, `pixel_w`, `pixel_h`). |
+| `0x20` | `LayoutUpdate` | Layout tree update (`session_id`, `window_id`, `tree`, `active_pane_id`). |
+| `0x21` | `ScreenSnapshot` | Full grid snapshot (`server_seq`, `pane_id`, `cols`, `rows`, `cursor`, `cells`). |
+| `0x22` | `FrameDiff` | Incremental dirty row diffs (`server_seq`, `acked_client_seq`, `diffs`). |
+| `0x23` | `ScrollbackSliceReq` | Copy Mode history request (`pane_id`, `start_line`, `line_count`). |
+| `0x24` | `ScrollbackSliceResp`| Compressed lines slice (`pane_id`, `start_line`, `lines`). |
+| `0x25` | `Passthrough` | Out-of-band events (OSC 52 clipboard payload, bell, window title). |
+| `0x30` | `Ping` | Heartbeat keep-alive (`timestamp`). |
+| `0x31` | `Pong` | Heartbeat response (`timestamp`). |
 
-#### B. Interactive Input & Terminal Event Messages (Client -> Server)
-Every input message carries a monotonically increasing `client_seq: u64`:
-- `KeyEvent { client_seq, target_pane, key_code, modifiers, raw_bytes }`: Supports both raw VT bytes and unambiguous Kitty Keyboard Protocol key events.
-- `MouseEvent { client_seq, pane_id, kind, button, col, row, modifiers }`: Server-routed mouse clicks, drags, and scroll-wheel events (automatically translated into pane-local coordinates by either client or server).
-- `PasteEvent { client_seq, pane_id, bracketed: bool, data: bytes }`: Atomic paste payload.
-- `ClientResize { cols: u16, rows: u16, pixel_width: u32, pixel_height: u32 }`: Triggers server-side layout recalculation and `ioctl(TIOCSWINSZ)` on affected pane PTYs.
+#### Cell Binary Serialization
+Each terminal cell is serialized into an 8-byte fixed structure + optional extended styles:
+- `codepoint`: `u32` (UTF-32 codepoint; `0` = empty space).
+- `width`: `u8` (0 = combining char, 1 = normal, 2 = wide/CJK/emoji).
+- `flags`: `u16` (bitmask: Bold, Italic, Underline, Blink, Reverse, Hidden, Strikethrough).
+- `fg_type`, `fg_r`, `fg_g`, `fg_b`: Foreground color (Default, Indexed, or Truecolor RGB).
+- `bg_type`, `bg_r`, `bg_g`, `bg_b`: Background color.
 
-#### C. Rendering, Synchronized Updates & Scrollback Messages (Server -> Client)
-Every state update carries a monotonically increasing `server_seq: u64` and `acked_client_seq: u64`:
-- `LayoutUpdate { server_seq, session_id, window_id, layout_tree, active_pane_id, zoomed_pane_id }`: Describes exact pane geometries (`x, y, width, height`) and border styles.
-- `ScreenSnapshot { server_seq, pane_id, cols, rows, cursor, modes, compressed_cells }`: Full visible matrix for a pane (sent on initial attach, session switch, or after a long disconnect).
-- `FrameDiff { server_seq, acked_client_seq, pane_diffs: Vec<PaneRowDiff>, status_line }`:
-  - Coalesced at an adaptive frame rate (up to 120 Hz for local/low-latency links, dynamically paced by RTT and QUIC/TCP congestion window on slow links).
-  - Client wraps each rendered frame in `DECSET 2026` (**Synchronized Output** `\x1b[?2026h ... \x1b[?2026l`) so the local terminal paints atomically with zero tearing.
-- `ScrollbackSliceReq` / `Resp`: When the user enters Copy Mode (`Prefix + [`) and scrolls up, the client fetches compressed pages of immutable scrollback history by line range `[start_line, end_line]` and caches them locally.
-- `PassthroughEvent { pane_id, kind: Osc52Clipboard | Bell | DesktopNotification | Hyperlink }`: Forwards clipboard writes (`OSC 52`), bells, and notifications directly to the local terminal without corrupting pane grid state.
+Runs of identical cells or snapshot grids are RLE encoded and compressed via `libzstd` before wire transmission.
 
 ---
 
 ## 5. Persistence, Roaming & Reconnection Mechanics
 
-### 5.1 Decoupling Client Connection Drop from Session Lifecycle
-On `tmux2d`:
-- **Sessions are immortal until explicitly killed or all child panes exit.**
-- Each connected client has a `ClientSessionState` holding:
+### 5.1 Decoupled Session Lifecycle
+- **Immortality:** Sessions and child PTY processes continue executing indefinitely regardless of client connectivity.
+- **Client Session State:** The daemon maintains a per-client record:
   - `client_instance_id` (128-bit UUID)
-  - `resume_token` (256-bit HMAC-authenticated token bound to the client certificate fingerprint, valid for configurable TTL, default 24 hours)
-  - Ring buffer of recent `FrameDiff` packets (e.g., last 256 frames / 1 MB) and last `acked_client_seq`.
+  - `resume_token` (256-bit cryptographic token valid for a configurable TTL, default 24h)
+  - Ring buffer of recent `FrameDiff` messages and last `acked_client_seq`.
 
-### 5.2 Fast Reconnect & Catch-Up Algorithm
-When a network interruption occurs (Wi-Fi drop, VPN toggle, laptop sleep/wake):
-1. **Client Side:**
-   - The client keeps the user's local terminal screen intact and renders a non-intrusive status indicator in the top-right corner (`[reconnecting to dev.example.com... 2s]`).
-   - Outbound keystrokes typed during a brief drop (optional/configurable) are buffered in a local outbound queue with their `client_seq` numbers.
-   - Exponential backoff with jitter (`100ms`, `250ms`, `500ms`, `1s`, max `5s`) plus immediate retry on OS network interface change (`netlink` / `NWPathMonitor`).
-2. **Handshake & Resumption:**
-   - Upon reconnecting over mTLS, the client sends `ClientHello` with its `resume_token`, `last_server_seq`, and `attached_session_id`.
-   - `tmux2d` verifies that the new connection's client certificate matches the `resume_token` owner.
-   - **Delta Resume:** If `last_server_seq` is still within the server's ring buffer, `tmux2d` replays only the missed `FrameDiff`s.
-   - **Snapshot Fallback:** If the client was offline longer than the ring buffer window, `tmux2d` immediately sends a fresh `LayoutUpdate` + `ScreenSnapshot` for the current window.
-   - **Input Deduplication:** The client replays any unacknowledged `KeyEvent`s (`client_seq > last_client_seq_acked`), ensuring neither dropped nor duplicated characters.
+### 5.2 Fast Reconnect & Catch-Up Protocol
+When a client experiences a network glitch, Wi-Fi migration, or laptop sleep:
+1. **Client TUI Hold:** The client keeps the current screen intact and overlays a status indicator (`[Reconnecting... attempt 2]`). Outbound keystrokes are buffered in a local queue tagged with `client_seq`.
+2. **Exponential Backoff:** Retries at 100ms, 250ms, 500ms, 1s, up to 5s max.
+3. **Resume Handshake:** The client presents its `resume_token` and `last_server_seq` in `ClientHello`.
+4. **Delta vs. Snapshot:**
+   - If `last_server_seq` is within the server's ring buffer, the daemon transmits only the missed `FrameDiff`s.
+   - If the client was offline too long, the daemon sends a fresh `ScreenSnapshot`.
+5. **Input Deduplication:** The client resends any unacknowledged keystrokes (`client_seq > last_client_seq_acked`). The daemon drops any already processed `client_seq`s, preventing duplicated keystrokes.
+6. **Multi-Client Sizing:** `window-size = latest` resizes the window and child PTYs (`TIOCSWINSZ`) to the dimensions of the client that most recently sent an input event.
 
 ---
 
-## 6. User Experience, CLI & Configuration Specification
+## 6. User Experience, CLI & Configuration
 
-### 6.1 Ergonomic CLI (No SSH Required)
-`tmux2` mirrors familiar `tmux` flags while adding native remote host targeting (`-H / --host` or `host:session` shorthand):
+### 6.1 Unified Binary CLI
+`tmux2` provides an intuitive command-line interface mirroring standard `tmux` syntax while adding network targeting:
 
 ```bash
-# 1. One-time PKI setup on server and profile import on client
-tmux2 pki init --host dev.example.com
-tmux2 profile import ./dev.tmux2-profile
+# Local session management (auto-spawns daemon if needed)
+tmux2 new -s dev
+tmux2 attach -t dev
+tmux2 ls
+tmux2 kill-session -t dev
 
-# 2. Start or attach to default session on remote server (or create if none exists)
-tmux2 -H dev new -A -s main
-
-# 3. Shorthand syntax: attach to session "work" on profile "dev"
-tmux2 attach dev:work
-
-# 4. List all running sessions across a remote server without attaching
+# Remote session management via mTLS profiles
+tmux2 -H dev.example.com new -s main
+tmux2 attach dev:main
 tmux2 -H dev ls
-# Output:
-# SESSION   WINDOWS   PANES   ATTACHED   CREATED          STATUS
-# main      4         7       1 (roam)   2 days ago       active
-# training  2         3       0          5 hours ago      detached (gpu_train.py running)
-# debug     1         2       0          12 mins ago      detached
 
-# 5. Spawn a background job in a new detached session remotely (no interactive shell needed!)
-tmux2 -H dev new-session -d -s build -c /src/app "cargo build --release"
+# Detach other clients on attach
+tmux2 attach -d -t dev
 
-# 6. Send keys or capture output from a remote session scriptably
-tmux2 -H dev capture-pane -t build:0.0 -p -S -100
+# Run detached command
+tmux2 new-session -d -s build "make -j8"
+
+# Daemon management
+tmux2 daemon --daemonize
+tmux2 daemon --install-service     # systemd user unit or LaunchAgent plist
+
+# Built-in PKI
+tmux2 pki init --host dev.example.com
+tmux2 pki export-client alice --server dev.example.com:8443 > alice.tmux2-profile
+tmux2 profile import alice.tmux2-profile
 ```
 
-### 6.2 Multi-Session Navigation Inside an Attached Client
-Once attached to any session on `dev`:
-- `Prefix + s`: Opens the interactive **Session & Window Chooser Overlay** (rendered locally with instant live preview of each session's active window). Selecting another session sends `SwitchSessionReq` and switches sessions in `< 10 ms` over the same mTLS connection.
-- `Prefix + d`: Sends `DetachReq` and exits cleanly back to the local workstation shell in `< 5 ms`.
-- `Prefix + $`: Rename current session.
-- `Prefix + ( / )`: Cycle to previous / next session on the remote server.
-- `Prefix + c` / `Prefix + %` / `Prefix + "`: Create window, vertical split, horizontal split (identical defaults to `tmux`).
+### 6.2 Daily-Driver Interactive TUI
+- **Prefix Engine:** Configurable default `Ctrl-b` prefix.
+- **Session Chooser Overlay (`Prefix + s`):** Interactive modal overlay listing all sessions and windows with live preview. Fast selection sends `MsgSwitchSessionReq` without dropping the connection.
+- **Copy Mode (`Prefix + [`):**
+  - Full vi navigation keys (`h, j, k, l`, `Ctrl-u`, `Ctrl-d`, `0`, `$`).
+  - Search forward (`/`) and backward (`?`).
+  - Visual selection (`v`, `V`).
+  - History paging fetching compressed slices from the daemon's `ScrollbackBuffer`.
+  - Yanking (`y`) emits an `OSC 52` sequence to update the local workstation clipboard.
+- **Synchronized Rendering (`DECSET 2026`):** All screen paints are enclosed in atomic frame delimiters (`\033[?2026h ... \033[?2026l`), eliminating flicker and partial tearing in modern terminals.
+- **Full Mouse Support:** Direct pane click-to-focus, split border drag-to-resize, and mouse scroll-wheel passing.
+- **Native OSC 52 Passthrough:** Pane-generated clipboard copies are intercepted by `VteScreen` callbacks and forwarded cleanly to the client terminal.
 
-### 6.3 Configuration Files (`~/.config/tmux2/config.toml`)
+### 6.3 Configuration (`config.toml` & `server.toml`)
+Configurations use TOML parsed via `tomlplusplus`:
 
 #### Client Configuration (`~/.config/tmux2/config.toml`)
 ```toml
 default_host = "dev"
 prefix_key = "C-b"
-escape_time_ms = 0          # Zero escape delay because key events are structured!
+escape_time_ms = 0
 mouse = true
 clipboard = "osc52"
 
 [hosts.dev]
 address = "dev.example.com:8443"
-transport = "auto"          # "quic" | "tcp" | "auto" (Happy Eyeballs QUIC -> TCP)
+transport = "auto"          # "quic" | "tcp" | "auto"
 ca_cert = "~/.config/tmux2/pki/dev/ca.crt"
 client_cert = "~/.config/tmux2/pki/dev/client.crt"
 client_key = "~/.config/tmux2/pki/dev/client.key"
 auto_reconnect = true
 ```
 
-#### Server Configuration (`/etc/tmux2/server.toml` or `~/.config/tmux2/server.toml`)
+#### Server Configuration (`~/.config/tmux2/server.toml`)
 ```toml
 listen_addrs = ["0.0.0.0:8443", "[::]:8443"]
-local_socket = "/run/tmux2/1000/default.sock"
-mode = "user"               # "user" or "system"
+local_socket = "/run/user/1000/tmux2/default.sock"
 scrollback_lines = 50000
-session_idle_timeout = "never"
 resume_token_ttl = "24h"
+window_size_policy = "latest"
 
 [tls]
 server_cert = "~/.config/tmux2/pki/server.crt"
@@ -312,33 +319,106 @@ server_key = "~/.config/tmux2/pki/server.key"
 client_ca_cert = "~/.config/tmux2/pki/ca.crt"
 require_client_cert = true
 min_version = "1.3"
-
-[[authorization.allow]]
-cert_san_uri = "tmux2://user/alice"
-unix_user = "alice"
-allowed_sessions = ["*"]
 ```
 
 ---
 
-## 7. Implementation Stack & Phased Roadmap
+## 7. C++23 Cross-Platform Architecture & Implementation Stack
 
-### 7.1 Recommended Technology Stack (Rust)
-- **Language:** Rust (memory-safe TLS/network parsing, fearless concurrency across PTY and socket tasks).
-- **Async Runtime:** `tokio`.
-- **TLS 1.3 & mTLS Cryptography:** `rustls` + `aws-lc-rs` or `ring`, with `rcgen` for built-in `tmux2 pki` certificate generation and `x509-parser` for SAN/extension extraction.
-- **QUIC Transport:** `quinn` (built on `rustls`, supports 0-RTT/1-RTT resumption and connection migration).
-- **PTY Management:** `rustix-openpty` / `portable-pty` + `nix` for process groups, signals, and `TIOCSWINSZ`.
-- **Server-Side VTE Parser & Grid:** `alacritty_terminal` or `vt100` / custom grid with zstd-compressed scrollback pages.
-- **Local Terminal Client UI:** `crossterm` or `termion` with synchronized output (`DECSET 2026`) and Kitty keyboard protocol support.
+### 7.1 Cross-Platform Core Technology Stack
+`tmux2` is implemented in **portable modern C++23** targeting both Linux and macOS:
 
-### 7.2 Phased Delivery Plan
-1. **Phase 1 (Core Daemon & mTLS Framing):**
-   - `tmux2 pki` certificate generator.
-   - `tmux2d` listening on TCP+TLS 1.3 (mTLS) and `tmux2` client with `ListSessions`, `NewSession`, `AttachSession`, `Detach`, and `SwitchSession`.
-2. **Phase 2 (VTE Grid, Multi-Window/Pane Layout & Diff Renderer):**
-   - Server-side VTE state machine per pane, binary split layout engine, status bar, and incremental `FrameDiff` rendering with `DECSET 2026`.
-3. **Phase 3 (QUIC Transport, Roaming & Scrollback Paging):**
-   - `quinn` QUIC transport with TCP fallback, `resume_token` sequence catch-up, and server-side scrollback paging + Copy Mode.
-4. **Phase 4 (System Multi-User Privilege Separation):**
-   - `tmux2d-listener` / `tmux2d-tls` / `tmux2d-user` split architecture with X.509 SAN-to-UID mapping and systemd socket activation.
+- **Language Standard:** `-std=c++23` using portable, header-based standard library features (`std::span`, `std::expected`, `std::optional`, `std::string_view`, `<bit>`, `<format>`, `<chrono>`). C++20/23 modules are explicitly avoided to guarantee seamless compilation across:
+  - Apple Clang (Xcode 16.0+) on macOS (Apple Silicon & Intel)
+  - GCC 14.1+ on Linux
+  - LLVM Clang 18.1+ on Linux and macOS
+- **Build System:** CMake 3.25+ supporting both system package managers (`pkg-config`) and CMake `FetchContent`.
+- **Binary Output:** Unified executable `tmux2` with symlink support (`tmux2d`).
+- **Cryptography & Network TLS:**
+  - **OpenSSL 3.5+**: Powers the unified cryptography stack, providing native TLS 1.3 mTLS, `OSSL_QUIC_*` client/server connections, and Ed25519 X.509v3 certificate generation and validation.
+- **Event Loop & Reactor:**
+  - High-performance, single-threaded lock-free Reactor.
+  - **Linux:** `epoll(7)` with `EPOLLIN`, `EPOLLOUT`, `EPOLLRDHUP`, and `EPOLLET` (edge-triggered) support.
+  - **macOS (Darwin):** `kqueue(2)` with `EVFILT_READ` and `EVFILT_WRITE`. Uses `poll(2)` fallback specifically for `/dev/tty` master/slave descriptors where Darwin kernel kqueue does not reliably report EOF/hangup conditions.
+  - **Timer Engine:** Min-heap timer queue coordinating timeouts and driving `SSL_get_event_timeout()` for OpenSSL QUIC event scheduling.
+- **Terminal Emulation (VTE):**
+  - Vendored/system `libvterm` wrapped in a C++23 RAII abstraction (`tmux2::vte::VteScreen`).
+  - Supports full 24-bit Truecolor RGB, indexed colors, alternate screen buffer, UTF-8 streaming, wide chars (CJK, emojis), cursor visibility/shapes, and terminal bell/title/selection callbacks.
+- **Scrollback & Compression:**
+  - Custom C++23 ring buffer (`tmux2::vte::ScrollbackBuffer`) using `libzstd` for block compression of inactive lines, achieving an 85%+ memory footprint reduction for large scrollbacks.
+- **PTY Subsystem:**
+  - Master/slave pseudo-terminal allocation (`openpty(3)`) via `<pty.h>` (Linux) and `<util.h>` (macOS).
+  - Terminfo capability detection with fallback chain (`tmux-256color` -> `xterm-256color` -> `vt100`).
+- **Wire Codec:**
+  - Zero-codegen binary encoder/decoder (`tmux2::protocol::BinaryWriter` / `BinaryReader`).
+- **Configuration & Testing:**
+  - `tomlplusplus` (`toml++`) for configuration parsing.
+  - `doctest` (2.4+) for comprehensive unit test execution.
+
+### 7.2 Directory & Module Structure
+
+```
+tmux2/
+├── CMakeLists.txt              # Cross-platform CMake 3.25+ build definition
+├── spec.md                     # Technical specification (this document)
+├── include/                    # Public API / shared headers
+└── src/
+    ├── reactor/                # Single-threaded Reactor (epoll / kqueue / timers)
+    │   ├── reactor.hpp/.cpp
+    │   ├── epoll_reactor.cpp   # Linux epoll backend
+    │   └── kqueue_reactor.cpp  # macOS kqueue + poll fallback backend
+    ├── pki/                    # OpenSSL 3.5+ Ed25519 X.509v3 PKI engine
+    │   ├── pki.hpp/.cpp
+    │   └── profile.hpp/.cpp
+    ├── config/                 # toml++ configuration parsers
+    │   ├── config.hpp/.cpp
+    │   └── server_config.hpp/.cpp
+    ├── protocol/               # Zero-codegen binary wire codec & cell models
+    │   ├── codec.hpp/.cpp
+    │   ├── messages.hpp
+    │   └── cell.hpp
+    ├── pty/                    # Cross-platform PTY management & terminfo
+    │   ├── pty_process.hpp/.cpp
+    │   └── terminfo.hpp/.cpp
+    ├── vte/                    # libvterm C++23 wrapper & compressed scrollback
+    │   ├── vte_wrapper.hpp/.cpp
+    │   ├── scrollback_buffer.hpp/.cpp
+    │   └── dirty_tracker.hpp/.cpp
+    ├── transport/              # Transport abstractions (OpenSSL QUIC / TCP / AF_UNIX)
+    │   ├── transport.hpp
+    │   ├── quic_transport.hpp/.cpp
+    │   ├── tls_tcp_transport.hpp/.cpp
+    │   └── unix_transport.hpp/.cpp
+    ├── server/                 # Server daemon engine, sessions, windows, layouts
+    │   ├── server.hpp/.cpp
+    │   ├── session.hpp/.cpp
+    │   ├── window.hpp/.cpp
+    │   └── layout.hpp/.cpp
+    ├── client/                 # TUI client, prefix engine, copy mode, renderer
+    │   ├── client.hpp/.cpp
+    │   ├── raw_tty.hpp/.cpp
+    │   ├── renderer.hpp/.cpp
+    │   └── copy_mode.hpp/.cpp
+    └── main.cpp                # Unified entrypoint (subcommands: client, daemon, pki)
+```
+
+### 7.3 Phased Roadmap
+
+1. **v1.0 (Core Cross-Platform Release — Current Target):**
+   - Single-threaded Reactor (`epoll` / `kqueue` + Darwin TTY `poll` fallback).
+   - Zero-codegen little-endian wire codec + `libzstd` RLE snapshots/diffs.
+   - Cross-platform PTY subsystem (`openpty`, `TIOCSWINSZ`, terminfo fallbacks).
+   - `libvterm` C++23 RAII VTE engine, Truecolor RGB, alternate screen, mouse, OSC 52.
+   - Chunked zstd-compressed scrollback ring buffer.
+   - OpenSSL 3.5+ Ed25519 X.509v3 PKI (`tmux2 pki`) & `0600` profiles.
+   - Dual transport: OpenSSL QUIC (UDP/8443) + TLS 1.3 TCP fallback + local `0600` `AF_UNIX` auto-spawn mode (`_NSGetExecutablePath` / `/proc/self/exe`).
+   - Rootless Mode A daemon (`--daemonize`, `systemd --user` & macOS `LaunchAgent`).
+   - Full TUI client: raw TTY mode, `Prefix+s` Session Chooser, `Prefix+[` Copy Mode, mouse hit-testing, `DECSET 2026` atomic rendering.
+   - Seamless reconnect, `resume_token` sequence replay & `client_seq` deduplication.
+   - Multi-client `window-size = latest` and `attach -d`.
+
+2. **v2.0+ (Enterprise Multi-User & Extended Features — Deferred):**
+   - Mode B privilege-separated multi-user root supervisor daemon (`tmux2d-listener` / `tmux2d-tls` / `tmux2d-user`) with PAM authentication and cgroup isolation.
+   - Optional Trust-On-First-Use (TOFU) key pinning without Root CAs.
+   - Certificate-based fine-grained RBAC extensions (read-only spectator certs, session whitelist restrictions).
+   - Remote file transfer & buffer piping RPCs.

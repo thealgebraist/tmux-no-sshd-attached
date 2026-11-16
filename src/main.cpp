@@ -49,8 +49,16 @@ int main(int argc, char* argv[]) {
         return tmux2::app::run_pki_export_client(opts);
     }
 
+    if (opts.command == tmux2::client::CliCommandType::PkiBootstrapServer) {
+        return tmux2::app::run_pki_bootstrap_server(opts);
+    }
+
     if (opts.command == tmux2::client::CliCommandType::ProfileImport) {
         return tmux2::app::run_profile_import(opts);
+    }
+
+    if (opts.command == tmux2::client::CliCommandType::Bootstrap) {
+        return tmux2::app::run_bootstrap(opts);
     }
 
     if (is_daemon || opts.command == tmux2::client::CliCommandType::Server) {

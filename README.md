@@ -24,7 +24,25 @@ See [spec.md](./spec.md) for the complete technical architecture and wire protoc
 
 Below is the step-by-step workflow to test `tmux2` directly from a MacBook client to this Linux server (`159.195.249.30`) over QUIC / TCP TLS 1.3 mTLS without SSH.
 
-### Step 1: On the Linux Server (`159.195.249.30`)
+### Quickest Method: 1-Command Bootstrap from Your MacBook (`tmux2 bootstrap`)
+
+Once `tmux2` is built on both machines (with `tmux2` in `~/.local/bin` or `~/tmux2/build` on the server), you can initialize the server's Ed25519 PKI, start `tmux2d --daemonize` on the server, and import the `0600` mTLS profile into your MacBook in a **single command**:
+
+```bash
+# On Your MacBook:
+./build/tmux2 bootstrap agent1@159.195.249.30 --name macbook
+
+# Now connect directly over QUIC / TCP TLS 1.3 mTLS (no ssh!):
+./build/tmux2 new -s dev
+```
+
+*(See [bootstrap.md](./bootstrap.md) for the full 9-iteration bootstrapping & Cloudflare Zero-Trust certificate distribution architecture.)*
+
+---
+
+### Manual Step-by-Step Method
+
+#### Step 1: On the Linux Server (`159.195.249.30`)
 
 1. **Build `tmux2` / `tmux2d`**:
    ```bash

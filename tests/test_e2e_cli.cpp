@@ -722,3 +722,34 @@ TEST_CASE("E2E CLI: Section 5 session resumption across re-attachments") {
     (void)run_cmd(bin, {"kill-session", "-t", "recontest", "--unix-socket", sock.string()});
     kill_process(dpid);
 }
+
+// ============================================================================
+// Test 8: One-Command Bootstrap (tmux2 bootstrap + pki bootstrap-server + profile import -)
+// ============================================================================
+TEST_CASE("E2E CLI: One-command bootstrap and stdin profile import") {
+    std::string bin = get_tmux2_bin();
+    TempDir srv_dir("tmux2_boot_srv_");
+    TempDir cli_dir("tmux2_boot_cli_");
+
+    std::string ssh_mock = "\"" + bin + "\" pki bootstrap-server --host 127.0.0.1 "
+                           "--server 127.0.0.1:19455 --user macbook --no-daemon --dir \"" +
+                           srv_dir.path.string() + "\"";
+
+    auto res_boot = run_cmd(bin, {
+        "bootstrap", "agent1@127.0.0.1:19455",
+        "--name", "macbook",
+        "--config-dir", cli_dir.path.string(),
+        "--ssh-cmd", ssh_mock
+    });
+    REQUIRE(res_boot.exit_code == 0);
+    CHECK(res_boot.stdout_str.find("Successfully bootstrapped profile") != std::string::npos);
+
+    // Verify 0600 permissions on imported client key and config.toml
+    CHECK(std::filesystem::exists(cli_dir.path / "config.toml"));
+    CHECK(check_permissions(cli_dir.path / "config.toml", 0600));
+    CHECK(std::filesystem::exists(cli_dir.path / "pki" / "macbook" / "client.key"));
+    CHECK(check_permissions(cli_dir.path / "pki" / "macbook" / "client.key", 0600));
+    CHECK(std::filesystem::exists(cli_dir.path / "pki" / "macbook" / "client.crt"));
+    CHECK(std::filesystem::exists(cli_dir.path / "pki" / "macbook" / "ca.crt"));
+}
+

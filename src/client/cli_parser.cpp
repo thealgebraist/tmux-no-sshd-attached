@@ -333,6 +333,20 @@ CliOptions CliParser::parse(std::span<const std::string_view> args, bool is_daem
                     else if (a == "--transport" && i + 1 < args.size()) opts.pki_transport = std::string(args[++i]);
                     ++i;
                 }
+            } else if (pki_sub == "bootstrap-server") {
+                opts.command = CliCommandType::PkiBootstrapServer;
+                while (i < args.size()) {
+                    std::string_view a = args[i];
+                    if (a == "--host" && i + 1 < args.size()) opts.pki_host = std::string(args[++i]);
+                    else if (a == "--user" && i + 1 < args.size()) opts.pki_user = std::string(args[++i]);
+                    else if (a == "--server" && i + 1 < args.size()) opts.pki_server = std::string(args[++i]);
+                    else if (a == "--listen" && i + 1 < args.size()) opts.pki_listen = std::string(args[++i]);
+                    else if (a == "--dir" && i + 1 < args.size()) opts.pki_dir = std::string(args[++i]);
+                    else if (a == "--config-dir" && i + 1 < args.size()) opts.config_dir = std::string(args[++i]);
+                    else if (a == "--transport" && i + 1 < args.size()) opts.pki_transport = std::string(args[++i]);
+                    else if (a == "--no-daemon") opts.detached = true;
+                    ++i;
+                }
             } else {
                 opts.success = false;
                 opts.error_message = "Unknown pki command: " + std::string(pki_sub);
@@ -340,6 +354,30 @@ CliOptions CliParser::parse(std::span<const std::string_view> args, bool is_daem
             }
         } else {
             opts.command = CliCommandType::Help;
+        }
+    } else if (subcmd == "bootstrap") {
+        opts.command = CliCommandType::Bootstrap;
+        while (i < args.size()) {
+            std::string_view a = args[i];
+            if ((a == "--user" || a == "--name") && i + 1 < args.size()) {
+                opts.pki_user = std::string(args[++i]);
+            } else if (a == "--server" && i + 1 < args.size()) {
+                opts.pki_server = std::string(args[++i]);
+            } else if (a == "--config-dir" && i + 1 < args.size()) {
+                opts.config_dir = std::string(args[++i]);
+            } else if (a == "--transport" && i + 1 < args.size()) {
+                opts.pki_transport = std::string(args[++i]);
+            } else if (a == "--ssh-cmd" && i + 1 < args.size()) {
+                opts.ssh_command = std::string(args[++i]);
+            } else if (!a.starts_with("-") && opts.bootstrap_target.empty()) {
+                opts.bootstrap_target = std::string(a);
+            }
+            ++i;
+        }
+        if (opts.bootstrap_target.empty() && opts.ssh_command.empty()) {
+            opts.success = false;
+            opts.error_message = "bootstrap requires a target ([user@]host[:port])";
+            return opts;
         }
     } else if (subcmd == "profile") {
         if (i < args.size() && args[i] == "import") {
@@ -349,15 +387,13 @@ CliOptions CliParser::parse(std::span<const std::string_view> args, bool is_daem
                 std::string_view a = args[i];
                 if (a == "--config-dir" && i + 1 < args.size()) {
                     opts.config_dir = std::string(args[++i]);
-                } else if (!a.starts_with("-") && opts.profile_file.empty()) {
+                } else if ((a == "-" || !a.starts_with("-")) && opts.profile_file.empty()) {
                     opts.profile_file = std::string(a);
                 }
                 ++i;
             }
             if (opts.profile_file.empty()) {
-                opts.success = false;
-                opts.error_message = "profile import requires a profile file argument";
-                return opts;
+                opts.profile_file = "-";
             }
         }
     } else {
@@ -383,9 +419,10 @@ std::string CliParser::format_help() {
            "  split-window [-h|-v] [-t target] [-c dir] [cmd...]\n"
            "  send-keys [-t target] <keys...>\n"
            "  capture-pane [-p] [-t target] [-S start] [-E end]\n"
-           "  pki init --host <host> [--user <user>] [--dir <dir>] [--listen <addr>]\n"
-           "  pki export-client [<name>] --server <server> [-o <file>] [--dir <dir>]\n"
-           "  profile import <file> [--config-dir <dir>]\n"
+           "  pki init [--host <host>] [--user <user>] [--dir <dir>] [--listen <addr>]\n"
+           "  pki export-client [<name>] [--server <server>] [-o <file>] [--dir <dir>]\n"
+           "  profile import [<file>|-] [--config-dir <dir>]\n"
+           "  bootstrap [user@]<host>[:port] [--name <profile>] [--config-dir <dir>]\n"
            "  server [--daemonize] [-c config] [--unix-socket <path>] [--listen <addr>] [--tcp-only] [--pid-file <path>]\n";
 }
 

@@ -6,6 +6,8 @@ namespace tmux2::app {
 
 int run_pki_init(const client::CliOptions& opts);
 int run_pki_export_client(const client::CliOptions& opts);
+int run_pki_bootstrap_server(const client::CliOptions& opts);
 int run_profile_import(const client::CliOptions& opts);
+int run_bootstrap(const client::CliOptions& opts);
 
 } // namespace tmux2::app

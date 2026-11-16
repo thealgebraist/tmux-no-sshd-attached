@@ -17,7 +17,9 @@ enum class CliCommandType {
     PrintLaunchdPlist,
     PkiInit,
     PkiExportClient,
+    PkiBootstrapServer,
     ProfileImport,
+    Bootstrap,
     NewSession,
     AttachSession,
     ListSessions,
@@ -66,6 +68,8 @@ struct CliOptions {
     std::string pki_out_file;
     std::string pki_transport{"auto"};
     std::string profile_file;
+    std::string bootstrap_target;
+    std::string ssh_command;
 
     // Config file override
     std::string config_path;

@@ -1,0 +1,39 @@
+# Build directories
+build/
+cmake-build-*/
+/tmp/tmux2-cmake-build/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+cmake_install.cmake
+
+# Object and library files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Executables and symlinks
+tmux2
+tmux2d
+test_reactor
+test_pki_config
+test_protocol
+test_pty_vte
+test_transport
+test_server
+test_client
+
+# OS and IDE files
+.DS_Store
+.directory
+.idea/
+.vscode/
+*.swp
+*~
+compile_commands.json
+Testing/

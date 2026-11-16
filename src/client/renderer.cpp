@@ -9,6 +9,10 @@ namespace tmux2::client {
 namespace {
 
 void append_utf8(char32_t cp, std::string& out) {
+    if (cp == 0) {
+        out.push_back(' ');
+        return;
+    }
     if (cp <= 0x7F) {
         out.push_back(static_cast<char>(cp));
     } else if (cp <= 0x7FF) {
@@ -147,9 +151,17 @@ void Renderer::draw_split_borders() {
         // Right vertical border (if not touching screen edge)
         uint16_t right_border_x = rect.x + rect.width;
         if (right_border_x < term_cols_) {
-            for (uint16_t y = rect.y; y < rect.y + rect.height && y < term_rows_ - 1; ++y) {
+            uint16_t max_y = rect.y + rect.height;
+            if (max_y < term_rows_ - 1) {
+                max_y += 1; // Include corner intersection
+            }
+            for (uint16_t y = rect.y; y < max_y && y < term_rows_ - 1; ++y) {
                 auto& cell = composite_screen_[static_cast<size_t>(y) * term_cols_ + right_border_x];
-                cell.codepoint = U'│'; // U+2502 Box Drawings Light Vertical
+                if (cell.codepoint == U'─' || cell.codepoint == U'┼') {
+                    cell.codepoint = U'┼';
+                } else {
+                    cell.codepoint = U'│'; // U+2502 Box Drawings Light Vertical
+                }
                 cell.width = 1;
                 cell.style = border_style;
             }
@@ -158,9 +170,13 @@ void Renderer::draw_split_borders() {
         // Bottom horizontal border (if not touching status bar)
         uint16_t bottom_border_y = rect.y + rect.height;
         if (bottom_border_y < term_rows_ - 1) {
-            for (uint16_t x = rect.x; x < rect.x + rect.width && x < term_cols_; ++x) {
+            uint16_t max_x = rect.x + rect.width;
+            if (max_x < term_cols_) {
+                max_x += 1; // Include corner intersection
+            }
+            for (uint16_t x = rect.x; x < max_x && x < term_cols_; ++x) {
                 auto& cell = composite_screen_[static_cast<size_t>(bottom_border_y) * term_cols_ + x];
-                if (cell.codepoint == U'│') {
+                if (cell.codepoint == U'│' || cell.codepoint == U'┼') {
                     cell.codepoint = U'┼'; // Intersection
                 } else {
                     cell.codepoint = U'─'; // U+2500 Box Drawings Light Horizontal
@@ -403,11 +419,18 @@ const protocol::Cell& Renderer::get_composite_cell(uint16_t col, uint16_t row) c
     return empty_cell;
 }
 
+void Renderer::set_composite_cell(uint16_t col, uint16_t row, const protocol::Cell& cell) {
+    if (col < term_cols_ && row < term_rows_) {
+        composite_screen_[static_cast<size_t>(row) * term_cols_ + col] = cell;
+    }
+}
+
 std::string Renderer::get_row_text(uint16_t row) const {
     std::string text;
     if (row >= term_rows_) return text;
     for (uint16_t c = 0; c < term_cols_; ++c) {
-        append_utf8(composite_screen_[static_cast<size_t>(row) * term_cols_ + c].codepoint, text);
+        char32_t cp = composite_screen_[static_cast<size_t>(row) * term_cols_ + c].codepoint;
+        append_utf8(cp == 0 ? U' ' : cp, text);
     }
     return text;
 }

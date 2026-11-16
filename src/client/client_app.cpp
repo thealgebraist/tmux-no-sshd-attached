@@ -16,7 +16,6 @@ void ClientApp::set_attached_session(uint32_t session_id, std::string name) {
 
 HitTestResult ClientApp::hit_test(uint16_t col, uint16_t row) const {
     HitTestResult res;
-    uint16_t term_cols = renderer_.term_cols();
     uint16_t term_rows = renderer_.term_rows();
 
     if (term_rows > 0 && row == term_rows - 1) {
@@ -520,18 +519,47 @@ std::vector<protocol::ProtocolMessage> ClientApp::prepare_reconnect_replay(uint6
 std::string ClientApp::render_frame(bool use_decset_2026) {
     renderer_.compose_frame();
 
-    if (session_chooser_.is_active()) {
-        // Blend modal session chooser onto shadow screen
-        // Create a copy of screen buffer from renderer composite
-        std::vector<protocol::Cell> composite(static_cast<size_t>(renderer_.term_cols()) * renderer_.term_rows());
-        for (uint16_t r = 0; r < renderer_.term_rows(); ++r) {
-            for (uint16_t c = 0; c < renderer_.term_cols(); ++c) {
-                composite[static_cast<size_t>(r) * renderer_.term_cols() + c] = renderer_.get_composite_cell(c, r);
+    // 1. If copy mode is active, overlay copy mode on active pane rect
+    if (copy_mode_.is_active()) {
+        uint32_t active_p = copy_mode_.pane_id();
+        const auto& rects = renderer_.pane_rects();
+        auto it = std::find_if(rects.begin(), rects.end(), [active_p](const PaneRect& r) {
+            return r.pane_id == active_p;
+        });
+        if (it != rects.end()) {
+            std::vector<protocol::Cell> pane_view;
+            copy_mode_.render_view(pane_view, it->width, it->height);
+            for (uint16_t r = 0; r < it->height; ++r) {
+                for (uint16_t c = 0; c < it->width; ++c) {
+                    size_t src_idx = static_cast<size_t>(r) * it->width + c;
+                    if (src_idx < pane_view.size()) {
+                        renderer_.set_composite_cell(it->x + c, it->y + r, pane_view[src_idx]);
+                    }
+                }
+            }
+            // Set active cursor to copy mode cursor position
+            auto cursor_pos = copy_mode_.cursor();
+            int64_t view_row = cursor_pos.line - copy_mode_.viewport_top_line();
+            if (view_row >= 0 && view_row < it->height && cursor_pos.col < it->width) {
+                renderer_.set_active_cursor(protocol::CursorState{
+                    .col = static_cast<uint16_t>(it->x + cursor_pos.col),
+                    .row = static_cast<uint16_t>(it->y + view_row),
+                    .visible = true,
+                    .shape = 0
+                });
             }
         }
-        session_chooser_.render_overlay(composite, renderer_.term_cols(), renderer_.term_rows());
-        // For testing / rendering, update composite cells
-        // To keep it simple, apply composite back or render directly
+    }
+
+    // 2. If session chooser is active, overlay centered modal window on top of screen
+    if (session_chooser_.is_active()) {
+        session_chooser_.render_overlay(renderer_.composite_screen(), renderer_.term_cols(), renderer_.term_rows());
+        renderer_.set_active_cursor(protocol::CursorState{
+            .col = 0,
+            .row = 0,
+            .visible = false,
+            .shape = 0
+        });
     }
 
     return renderer_.render_frame_vt(use_decset_2026);

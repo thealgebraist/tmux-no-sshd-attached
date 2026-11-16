@@ -31,6 +31,7 @@ public:
     [[nodiscard]] int64_t viewport_top_line() const noexcept { return viewport_top_line_; }
     [[nodiscard]] CopyPosition cursor() const noexcept { return cursor_; }
     [[nodiscard]] bool is_selecting() const noexcept { return selecting_; }
+    [[nodiscard]] bool is_line_selecting() const noexcept { return line_selection_; }
     [[nodiscard]] std::string_view search_query() const noexcept { return search_query_; }
 
     // History caching & paging
@@ -65,9 +66,11 @@ private:
     CopyPosition cursor_{0, 0};
 
     bool selecting_{false};
+    bool line_selection_{false};
     CopyPosition sel_start_{0, 0};
 
     bool search_mode_{false};
+    bool search_forward_{true};
     std::string search_query_;
 
     std::map<uint64_t, protocol::ScrollbackLine> history_cache_;

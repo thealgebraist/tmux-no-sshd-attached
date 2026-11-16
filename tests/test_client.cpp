@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #include <doctest/doctest.h>
 
 #include "src/client/client.hpp"
@@ -943,4 +944,217 @@ TEST_CASE("Client: ReconnectBuffer - Capacity Overflow Eviction") {
     CHECK(unacked[0].client_seq == s2);
     CHECK(unacked[1].client_seq == s3);
     CHECK(unacked[2].client_seq == s4);
+}
+
+TEST_CASE("Client: InputParser - Escape sequence edge cases and malformed input") {
+    InputParser parser;
+
+    // Alt+Enter (\x1b\r)
+    {
+        std::string seq = "\x1b\r";
+        auto evs = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq.data()), seq.size()));
+        REQUIRE(evs.size() == 1);
+        auto k = std::get<ClientKeyEvent>(evs[0]);
+        CHECK(k.key_code == SpecialKey::Enter);
+        CHECK((k.modifiers & KeyModifiers::Alt) != 0);
+    }
+
+    // Alt+Tab (\x1b\t)
+    {
+        std::string seq = "\x1b\t";
+        auto evs = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq.data()), seq.size()));
+        REQUIRE(evs.size() == 1);
+        auto k = std::get<ClientKeyEvent>(evs[0]);
+        CHECK(k.key_code == SpecialKey::Tab);
+        CHECK((k.modifiers & KeyModifiers::Alt) != 0);
+    }
+
+    // Alt+Backspace (\x1b\x7f)
+    {
+        std::string seq = "\x1b\x7f";
+        auto evs = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq.data()), seq.size()));
+        REQUIRE(evs.size() == 1);
+        auto k = std::get<ClientKeyEvent>(evs[0]);
+        CHECK(k.key_code == SpecialKey::Backspace);
+        CHECK((k.modifiers & KeyModifiers::Alt) != 0);
+    }
+
+    // Double ESC (\x1b\x1b) followed by 'x' -> ESC then Alt+x
+    {
+        std::string seq = "\x1b\x1b""x";
+        auto evs = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq.data()), seq.size()));
+        REQUIRE(evs.size() == 2);
+        auto k1 = std::get<ClientKeyEvent>(evs[0]);
+        CHECK(k1.key_code == SpecialKey::Escape);
+        auto k2 = std::get<ClientKeyEvent>(evs[1]);
+        CHECK(k2.key_code == 'x');
+        CHECK((k2.modifiers & KeyModifiers::Alt) != 0);
+    }
+
+    // Malformed SGR mouse input: must consume malformed chunk without hanging parser
+    {
+        std::string seq = "\x1b[<;;;Mhello";
+        auto evs = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq.data()), seq.size()));
+        // "hello" should be parsed successfully as 5 key events
+        REQUIRE(evs.size() == 5);
+        CHECK(std::get<ClientKeyEvent>(evs[0]).key_code == 'h');
+        CHECK(std::get<ClientKeyEvent>(evs[4]).key_code == 'o');
+
+        // Unknown sequence with non-digits
+        std::string seq2 = "\x1b[<xyz" "ok";
+        auto evs2 = parser.parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(seq2.data()), seq2.size()));
+        // Discards \x1b[<, then parses "xyzok" without hanging
+        CHECK_FALSE(evs2.empty());
+    }
+}
+
+TEST_CASE("Client: Renderer - Border intersection '+' and codepoint 0 handling") {
+    Renderer r(80, 24);
+    // 2x2 grid of panes:
+    // Pane 1: (0, 0, 39, 11), Pane 2: (40, 0, 40, 11)
+    // Pane 3: (0, 12, 39, 11), Pane 4: (40, 12, 40, 11)
+    // Vertical border at x=39, Horizontal border at y=11
+    // Intersection at (39, 11)
+    std::vector<PaneRect> rects = {
+        PaneRect{.pane_id = 1, .x = 0, .y = 0, .width = 39, .height = 11},
+        PaneRect{.pane_id = 2, .x = 40, .y = 0, .width = 40, .height = 11},
+        PaneRect{.pane_id = 3, .x = 0, .y = 12, .width = 39, .height = 11},
+        PaneRect{.pane_id = 4, .x = 40, .y = 12, .width = 40, .height = 11}
+    };
+    r.set_pane_rects(rects);
+    r.compose_frame();
+
+    // Check intersection cell at (39, 11)
+    const auto& cell_inter = r.get_composite_cell(39, 11);
+    CHECK(cell_inter.codepoint == U'┼');
+
+    // Check row text conversion on empty cells: codepoint 0 must output ' ', not '\0'
+    // Row 0 has 79 ASCII spaces + 1 3-byte UTF-8 border '│', giving 82 bytes
+    std::string row_text = r.get_row_text(0);
+    CHECK(row_text.size() == 82);
+    CHECK(row_text.find('\0') == std::string::npos);
+}
+
+TEST_CASE("Client: CopyMode - Backward search '?', line selection 'V', and whitespace trimming") {
+    CopyMode cm;
+    cm.enter(1, 40, 5, 5);
+
+    // Populate lines:
+    // Line 0: "first match string"
+    // Line 1: "middle line"
+    // Line 2: "second match string"
+    // Line 3: "another line"
+    // Line 4: "third match string"
+    auto make_line = [](std::string_view s) {
+        ScrollbackLine l;
+        for (char ch : s) {
+            l.cells.push_back(Cell{.codepoint = static_cast<char32_t>(ch), .width = 1});
+        }
+        return l;
+    };
+
+    cm.add_local_history_lines(0, std::vector<ScrollbackLine>{
+        make_line("first match string    "),
+        make_line("middle line           "),
+        make_line("second match string   "),
+        make_line("another line          "),
+        make_line("third match string    ")
+    });
+
+    // Start cursor at line 4
+    // Backward search with '?'
+    cm.handle_key(ClientKeyEvent{.key_code = '?'});
+    for (char c : std::string("match")) {
+        cm.handle_key(ClientKeyEvent{.key_code = static_cast<uint32_t>(c)});
+    }
+    cm.handle_key(ClientKeyEvent{.key_code = SpecialKey::Enter});
+
+    // Should have moved cursor backward to line 2
+    CHECK(cm.cursor().line == 2);
+
+    // Next match in same backward direction with 'n'
+    cm.handle_key(ClientKeyEvent{.key_code = 'n'});
+    CHECK(cm.cursor().line == 0);
+
+    // Reverse search direction with 'N' (forward to line 2)
+    cm.handle_key(ClientKeyEvent{.key_code = 'N'});
+    CHECK(cm.cursor().line == 2);
+
+    // Visual line selection 'V'
+    cm.handle_key(ClientKeyEvent{.key_code = 'V'});
+    CHECK(cm.is_selecting());
+    CHECK(cm.is_line_selecting());
+
+    // Move cursor down to line 3 with 'j'
+    cm.handle_key(ClientKeyEvent{.key_code = 'j'});
+    CHECK(cm.cursor().line == 3);
+
+    // Yank selected lines
+    std::string text = cm.get_selected_text();
+    // Should have 2 lines, trimmed of trailing spaces, separated by newline
+    CHECK(text == "second match string\nanother line");
+}
+
+TEST_CASE("Client: SessionChooser - Scrolling when sessions exceed box height") {
+    SessionChooser chooser;
+    std::vector<SessionSummary> sessions;
+    for (int i = 0; i < 30; ++i) {
+        sessions.push_back(SessionSummary{
+            .session_id = static_cast<uint32_t>(i + 1),
+            .name = std::format("session-{}", i),
+            .window_count = 1,
+            .attached_clients = 0,
+            .preview_summary = "test"
+        });
+    }
+
+    chooser.open(sessions);
+    // Move down 25 times
+    for (int i = 0; i < 25; ++i) {
+        chooser.handle_key(ClientKeyEvent{.key_code = SpecialKey::Down});
+    }
+    CHECK(chooser.selected_index() == 25);
+
+    // Render on 80x24 screen
+    std::vector<Cell> screen(80 * 24, Cell{.codepoint = U' '});
+    chooser.render_overlay(screen, 80, 24);
+
+    // Verify session-25 text is rendered in the screen cells
+    bool found_session_25 = false;
+    for (const auto& cell : screen) {
+        if (cell.codepoint == U'2' && (&cell + 1 < &screen.back()) && (&cell)[1].codepoint == U'5') {
+            found_session_25 = true;
+            break;
+        }
+    }
+    CHECK(found_session_25);
+}
+
+TEST_CASE("Client: ClientApp::render_frame - Overlays rendered into VT output") {
+    ClientApp app(80, 24);
+    std::vector<PaneRect> rects = {
+        PaneRect{.pane_id = 1, .x = 0, .y = 0, .width = 80, .height = 23}
+    };
+    app.renderer().set_pane_rects(rects);
+    app.renderer().set_active_pane(1);
+
+    // 1. Session Chooser overlay in render_frame
+    app.session_chooser().open({
+        SessionSummary{.session_id = 1, .name = "mysession", .window_count = 1, .attached_clients = 1}
+    });
+    CHECK(app.session_chooser().is_active());
+
+    std::string vt_chooser = app.render_frame(false);
+    CHECK(vt_chooser.find("Sessions") != std::string::npos);
+    CHECK(vt_chooser.find("mysession") != std::string::npos);
+
+    app.session_chooser().close();
+    CHECK_FALSE(app.session_chooser().is_active());
+
+    // 2. Copy Mode overlay in render_frame
+    app.copy_mode().enter(1, 80, 23, 10);
+    CHECK(app.copy_mode().is_active());
+
+    std::string vt_copymode = app.render_frame(false);
+    CHECK(vt_copymode.find("Copy Mode:") != std::string::npos);
 }

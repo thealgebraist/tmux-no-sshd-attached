@@ -1,5 +1,6 @@
 #include "src/client/tty_raw.hpp"
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <sys/ioctl.h>
@@ -11,7 +12,6 @@ TtyRaw::TtyRaw(int stdin_fd, int stdout_fd)
     : stdin_fd_(stdin_fd), stdout_fd_(stdout_fd) {}
 
 TtyRaw::~TtyRaw() {
-    disable_raw_mode();
     if (mouse_active_) {
         disable_mouse();
     }
@@ -24,6 +24,7 @@ TtyRaw::~TtyRaw() {
     if (alt_screen_active_) {
         leave_alt_screen();
     }
+    disable_raw_mode();
 }
 
 TtyRaw::TtyRaw(TtyRaw&& other) noexcept
@@ -46,11 +47,11 @@ TtyRaw::TtyRaw(TtyRaw&& other) noexcept
 
 TtyRaw& TtyRaw::operator=(TtyRaw&& other) noexcept {
     if (this != &other) {
-        disable_raw_mode();
         if (mouse_active_) disable_mouse();
         if (bracketed_paste_active_) disable_bracketed_paste();
         if (cursor_hidden_) show_cursor();
         if (alt_screen_active_) leave_alt_screen();
+        disable_raw_mode();
 
         stdin_fd_ = other.stdin_fd_;
         stdout_fd_ = other.stdout_fd_;
@@ -190,7 +191,11 @@ void TtyRaw::write_raw(std::string_view bytes) {
     size_t remaining = bytes.size();
     while (remaining > 0) {
         ssize_t written = ::write(stdout_fd_, ptr, remaining);
-        if (written <= 0) break;
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (written == 0) break;
         ptr += written;
         remaining -= static_cast<size_t>(written);
     }

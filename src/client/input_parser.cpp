@@ -241,47 +241,102 @@ size_t InputParser::try_parse_escape(std::span<const uint8_t> span, std::vector<
         return try_parse_ss3(span, out);
     }
 
-    // Alt + key (e.g. \x1b + 'a' -> Alt-a)
-    if (span.size() >= 2) {
-        uint8_t k = span[1];
-        if (k != 0x1b && k >= 0x20 && k <= 0x7e) {
-            out.push_back(ClientKeyEvent{
-                .key_code = k,
-                .modifiers = KeyModifiers::Alt,
-                .raw_bytes = {0x1b, k}
-            });
-            return 2;
-        }
+    // If second byte is another ESC (e.g. \x1b\x1b...): emit standalone ESC and consume 1 byte
+    // Next iteration will process second ESC cleanly
+    if (second == 0x1b) {
+        out.push_back(ClientKeyEvent{
+            .key_code = SpecialKey::Escape,
+            .modifiers = KeyModifiers::None,
+            .raw_bytes = {0x1b}
+        });
+        return 1;
     }
 
-    return 0;
+    // Alt + common special keys
+    if (second == '\r' || second == '\n') {
+        out.push_back(ClientKeyEvent{
+            .key_code = SpecialKey::Enter,
+            .modifiers = KeyModifiers::Alt,
+            .raw_bytes = {0x1b, second}
+        });
+        return 2;
+    }
+    if (second == '\t') {
+        out.push_back(ClientKeyEvent{
+            .key_code = SpecialKey::Tab,
+            .modifiers = KeyModifiers::Alt,
+            .raw_bytes = {0x1b, second}
+        });
+        return 2;
+    }
+    if (second == 0x7f || second == 0x08) {
+        out.push_back(ClientKeyEvent{
+            .key_code = SpecialKey::Backspace,
+            .modifiers = KeyModifiers::Alt,
+            .raw_bytes = {0x1b, second}
+        });
+        return 2;
+    }
+
+    // Alt + key (e.g. \x1b + 'a' -> Alt-a)
+    if (second >= 0x20 && second <= 0x7e) {
+        out.push_back(ClientKeyEvent{
+            .key_code = second,
+            .modifiers = KeyModifiers::Alt,
+            .raw_bytes = {0x1b, second}
+        });
+        return 2;
+    }
+
+    // Fallback: unhandled byte following ESC; consume ESC as standalone Escape to avoid parser stall
+    out.push_back(ClientKeyEvent{
+        .key_code = SpecialKey::Escape,
+        .modifiers = KeyModifiers::None,
+        .raw_bytes = {0x1b}
+    });
+    return 1;
 }
 
 size_t InputParser::try_parse_sgr_mouse(std::span<const uint8_t> span, std::vector<InputEvent>& out) {
     // Expected format: \x1b[< {btn} ; {col} ; {row} (M|m)
-    if (span.size() < 6) return 0;
+    if (span.size() < 3) return 0;
 
     size_t end_idx = 3;
-    while (end_idx < span.size() && span[end_idx] != 'M' && span[end_idx] != 'm') {
+    while (end_idx < span.size() && ((span[end_idx] >= '0' && span[end_idx] <= '9') || span[end_idx] == ';')) {
+        if (end_idx > 32) {
+            return 3; // runaway parameter length
+        }
         ++end_idx;
     }
-    if (end_idx >= span.size()) return 0; // Incomplete
+
+    if (end_idx >= span.size()) {
+        return 0; // Incomplete, waiting for terminator
+    }
+
+    if (span[end_idx] != 'M' && span[end_idx] != 'm') {
+        // Unexpected character in SGR mouse sequence; consume prefix to avoid stalling
+        return 3;
+    }
 
     std::string_view payload(reinterpret_cast<const char*>(span.data() + 3), end_idx - 3);
     char term_char = static_cast<char>(span[end_idx]);
 
     // Parse button;col;row
     auto semi1 = payload.find(';');
-    if (semi1 == std::string_view::npos) return 0;
+    if (semi1 == std::string_view::npos) return end_idx + 1;
     auto semi2 = payload.find(';', semi1 + 1);
-    if (semi2 == std::string_view::npos) return 0;
+    if (semi2 == std::string_view::npos) return end_idx + 1;
 
     int btn = 0;
     int col = 0;
     int row = 0;
-    std::from_chars(payload.data(), payload.data() + semi1, btn);
-    std::from_chars(payload.data() + semi1 + 1, payload.data() + semi2, col);
-    std::from_chars(payload.data() + semi2 + 1, payload.data() + payload.size(), row);
+    auto [p1, ec1] = std::from_chars(payload.data(), payload.data() + semi1, btn);
+    auto [p2, ec2] = std::from_chars(payload.data() + semi1 + 1, payload.data() + semi2, col);
+    auto [p3, ec3] = std::from_chars(payload.data() + semi2 + 1, payload.data() + payload.size(), row);
+
+    if (ec1 != std::errc{} || ec2 != std::errc{} || ec3 != std::errc{}) {
+        return end_idx + 1; // Malformed parameters, consume whole sequence
+    }
 
     ClientMouseEvent ev;
     ev.col = (col > 0) ? static_cast<uint16_t>(col - 1) : 0;
@@ -341,6 +396,9 @@ size_t InputParser::try_parse_csi(std::span<const uint8_t> span, std::vector<Inp
     // Find the terminal byte of CSI: 0x40-0x7E ('@' - '~')
     size_t i = 2;
     while (i < span.size() && (span[i] < 0x40 || span[i] > 0x7E)) {
+        if (i > 64) {
+            return 2; // consume \x1b[ to avoid stall on runaway sequence
+        }
         ++i;
     }
     if (i >= span.size()) {

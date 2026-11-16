@@ -92,8 +92,12 @@ public:
     void compose_frame(); // Builds composite screen buffer
     [[nodiscard]] std::string render_frame_vt(bool use_decset_2026 = true) const;
 
-    // Direct access to composite frame for testing
+    // Direct access to composite frame for testing and overlays
     [[nodiscard]] const protocol::Cell& get_composite_cell(uint16_t col, uint16_t row) const;
+    void set_composite_cell(uint16_t col, uint16_t row, const protocol::Cell& cell);
+    [[nodiscard]] std::vector<protocol::Cell>& composite_screen() noexcept { return composite_screen_; }
+    [[nodiscard]] const std::vector<protocol::Cell>& composite_screen() const noexcept { return composite_screen_; }
+    void set_active_cursor(const protocol::CursorState& cursor) noexcept { active_cursor_ = cursor; }
     [[nodiscard]] std::string get_row_text(uint16_t row) const;
     [[nodiscard]] protocol::CursorState get_active_cursor() const;
 

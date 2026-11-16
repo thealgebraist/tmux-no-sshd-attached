@@ -9,6 +9,10 @@ namespace tmux2::client {
 namespace {
 
 void append_utf8_char(char32_t cp, std::string& out) {
+    if (cp == 0) {
+        out.push_back(' ');
+        return;
+    }
     if (cp <= 0x7F) {
         out.push_back(static_cast<char>(cp));
     } else if (cp <= 0x7FF) {
@@ -44,22 +48,31 @@ void CopyMode::enter(uint32_t pane_id, uint16_t view_cols, uint16_t view_rows, u
 
     active_ = true;
     selecting_ = false;
+    line_selection_ = false;
     search_mode_ = false;
+    search_forward_ = true;
     search_query_.clear();
 }
 
 void CopyMode::exit() {
     active_ = false;
     selecting_ = false;
+    line_selection_ = false;
     search_mode_ = false;
 }
 
 void CopyMode::receive_slice_resp(const protocol::MsgScrollbackSliceResp& resp) {
     if (resp.pane_id != pane_id_) return;
+    uint64_t old_total = total_lines_;
     total_lines_ = std::max(total_lines_, resp.total_available_lines);
 
     for (size_t i = 0; i < resp.lines.size(); ++i) {
         history_cache_[resp.start_line + i] = resp.lines[i];
+    }
+
+    if (cursor_.line == static_cast<int64_t>(old_total - 1) && total_lines_ > old_total) {
+        cursor_.line = static_cast<int64_t>(total_lines_ - 1);
+        scroll_viewport_to_cursor();
     }
 }
 
@@ -129,7 +142,7 @@ CopyMode::KeyResult CopyMode::handle_key(const ClientKeyEvent& key) {
         }
         if (key.key_code == SpecialKey::Enter) {
             search_mode_ = false;
-            execute_search(true);
+            execute_search(search_forward_);
             res.slice_req = check_missing_slices();
             return res;
         }
@@ -204,13 +217,26 @@ CopyMode::KeyResult CopyMode::handle_key(const ClientKeyEvent& key) {
         cursor_.col = 0;
         scroll_viewport_to_cursor();
     }
-    // Space or v: toggle selection
-    else if (key.key_code == ' ' || key.key_code == 'v') {
-        if (!selecting_) {
+    // Space or v: toggle character selection
+    else if (key.key_code == ' ' || (key.key_code == 'v' && (key.modifiers == KeyModifiers::None))) {
+        if (!selecting_ || line_selection_) {
             selecting_ = true;
+            line_selection_ = false;
             sel_start_ = cursor_;
         } else {
             selecting_ = false;
+            line_selection_ = false;
+        }
+    }
+    // V or Shift-v: toggle line selection
+    else if (key.key_code == 'V' || (key.key_code == 'v' && (key.modifiers & KeyModifiers::Shift))) {
+        if (!selecting_ || !line_selection_) {
+            selecting_ = true;
+            line_selection_ = true;
+            sel_start_ = cursor_;
+        } else {
+            selecting_ = false;
+            line_selection_ = false;
         }
     }
     // Enter or y: Yank selection
@@ -220,18 +246,25 @@ CopyMode::KeyResult CopyMode::handle_key(const ClientKeyEvent& key) {
         res.exited = true;
         return res;
     }
-    // /: search
+    // /: search forward
     else if (key.key_code == '/') {
         search_mode_ = true;
+        search_forward_ = true;
         search_query_.clear();
     }
-    // n: next match
-    else if (key.key_code == 'n') {
-        execute_search(true);
+    // ?: search backward
+    else if (key.key_code == '?') {
+        search_mode_ = true;
+        search_forward_ = false;
+        search_query_.clear();
     }
-    // N: previous match
+    // n: next match (in search direction)
+    else if (key.key_code == 'n') {
+        execute_search(search_forward_);
+    }
+    // N: previous match (opposite to search direction)
     else if (key.key_code == 'N') {
-        execute_search(false);
+        execute_search(!search_forward_);
     }
 
     res.slice_req = check_missing_slices();
@@ -269,6 +302,11 @@ std::string CopyMode::get_selected_text() const {
     CopyPosition start = selecting_ ? std::min(sel_start_, cursor_) : cursor_;
     CopyPosition end = selecting_ ? std::max(sel_start_, cursor_) : cursor_;
 
+    if (line_selection_) {
+        start.col = 0;
+        end.col = view_cols_ > 0 ? static_cast<uint16_t>(view_cols_ - 1) : 0;
+    }
+
     std::string result;
     for (int64_t l = start.line; l <= end.line; ++l) {
         auto it = history_cache_.find(static_cast<uint64_t>(l));
@@ -280,10 +318,17 @@ std::string CopyMode::get_selected_text() const {
         uint16_t c_start = (l == start.line) ? start.col : 0;
         uint16_t c_end = (l == end.line) ? end.col : static_cast<uint16_t>(line_cells.size());
 
+        std::string line_str;
         for (uint16_t c = c_start; c <= c_end && c < line_cells.size(); ++c) {
-            append_utf8_char(line_cells[c].codepoint, result);
+            append_utf8_char(line_cells[c].codepoint, line_str);
         }
 
+        // Trim trailing spaces from line
+        while (!line_str.empty() && line_str.back() == ' ') {
+            line_str.pop_back();
+        }
+
+        result.append(line_str);
         if (l < end.line) {
             result.push_back('\n');
         }
@@ -303,6 +348,10 @@ void CopyMode::render_view(std::vector<protocol::Cell>& dst_cells, uint16_t widt
 
     CopyPosition sel_min = std::min(sel_start_, cursor_);
     CopyPosition sel_max = std::max(sel_start_, cursor_);
+    if (line_selection_) {
+        sel_min.col = 0;
+        sel_max.col = width > 0 ? static_cast<uint16_t>(width - 1) : 0;
+    }
 
     protocol::CellStyle sel_style;
     sel_style.bg = protocol::Color::rgb(60, 100, 180);

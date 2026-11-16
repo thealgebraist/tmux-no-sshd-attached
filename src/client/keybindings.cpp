@@ -1,5 +1,7 @@
 #include "src/client/keybindings.hpp"
 
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
 #include <cctype>
 
 namespace tmux2::client {

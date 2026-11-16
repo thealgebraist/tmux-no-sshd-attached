@@ -173,7 +173,7 @@ void SessionChooser::render_overlay(std::vector<protocol::Cell>& screen, uint16_
     uint16_t row_cur = start_y + 1;
     if (!filter_.empty() && row_cur < start_y + box_h - 1) {
         std::string filter_line = std::format(" Filter: {}_", filter_);
-        for (size_t i = 0; i < filter_line.size() && (start_x + 1 + i) < (start_x + box_w - 1); ++i) {
+        for (size_t i = 0; i < filter_line.size() && (start_x + 1 + i) < static_cast<size_t>(start_x + box_w - 1); ++i) {
             size_t idx = static_cast<size_t>(row_cur) * term_cols + (start_x + 1 + i);
             if (idx < screen.size()) {
                 screen[idx] = protocol::Cell{
@@ -188,11 +188,16 @@ void SessionChooser::render_overlay(std::vector<protocol::Cell>& screen, uint16_
 
     // List sessions
     auto list = filtered_sessions();
-    size_t max_items = (start_y + box_h - 2) - row_cur;
+    size_t max_items = (start_y + box_h > row_cur + 1) ? static_cast<size_t>((start_y + box_h - 1) - row_cur) : 0;
+    size_t scroll_offset = 0;
+    if (selected_index_ >= max_items && max_items > 0) {
+        scroll_offset = selected_index_ - max_items + 1;
+    }
 
-    for (size_t i = 0; i < list.size() && i < max_items; ++i) {
-        const auto& s = list[i];
-        bool is_sel = (i == selected_index_);
+    for (size_t i = 0; i < max_items && (i + scroll_offset) < list.size(); ++i) {
+        size_t item_idx = i + scroll_offset;
+        const auto& s = list[item_idx];
+        bool is_sel = (item_idx == selected_index_);
         const auto& style = is_sel ? selected_style : box_style;
 
         std::string line = std::format(" {} {} ({} win, {} att) - {}",
@@ -202,9 +207,9 @@ void SessionChooser::render_overlay(std::vector<protocol::Cell>& screen, uint16_
             s.attached_clients,
             s.preview_summary.empty() ? "active" : s.preview_summary);
 
-        uint16_t line_y = row_cur + i;
+        uint16_t line_y = static_cast<uint16_t>(row_cur + i);
         for (uint16_t col = 1; col < box_w - 1; ++col) {
-            char32_t cp = (col - 1 < line.size()) ? static_cast<char32_t>(line[col - 1]) : U' ';
+            char32_t cp = (static_cast<size_t>(col - 1) < line.size()) ? static_cast<char32_t>(line[col - 1]) : U' ';
             size_t idx = static_cast<size_t>(line_y) * term_cols + (start_x + col);
             if (idx < screen.size()) {
                 screen[idx] = protocol::Cell{

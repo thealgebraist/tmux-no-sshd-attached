@@ -60,10 +60,6 @@ void QuicStream::close() {
     }
 }
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#endif
 std::expected<size_t, std::error_code> QuicStream::write(std::span<const std::byte> data) {
     if (is_closed()) {
         return std::unexpected(std::make_error_code(std::errc::not_connected));
@@ -73,9 +69,16 @@ std::expected<size_t, std::error_code> QuicStream::write(std::span<const std::by
         return size_t{0};
     }
 
+    auto append_out = [this](std::span<const std::byte> b) {
+        if (b.empty()) return;
+        size_t old_size = m_out_buffer.size();
+        m_out_buffer.resize(old_size + b.size());
+        std::memcpy(m_out_buffer.data() + old_size, b.data(), b.size());
+    };
+
     flush_outbound();
     if (!m_out_buffer.empty()) {
-        m_out_buffer.insert(m_out_buffer.end(), data.data(), data.data() + data.size());
+        append_out(data);
         return data.size();
     }
 
@@ -84,21 +87,18 @@ std::expected<size_t, std::error_code> QuicStream::write(std::span<const std::by
     if (ret <= 0) {
         int err = SSL_get_error(m_ssl, ret);
         if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-            m_out_buffer.insert(m_out_buffer.end(), data.data(), data.data() + data.size());
+            append_out(data);
             return data.size();
         }
         return std::unexpected(std::make_error_code(std::errc::io_error));
     }
 
     if (data.size() > written) {
-        m_out_buffer.insert(m_out_buffer.end(), data.data() + written, data.data() + data.size());
+        append_out(data.subspan(written));
     }
 
     return data.size();
 }
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 std::expected<size_t, std::error_code> QuicStream::read(std::span<std::byte> out) {
     if (out.empty()) return 0;
